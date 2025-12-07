@@ -140,6 +140,21 @@ class HyCoRecSystem(BaseSystem):
         )
         self.view_optimizer = torch.optim.Adam(view_params, lr=self.view_lr, weight_decay=self.view_wd)
 
+        # 预训练阶段：用10个epoch初始化主模型（不用early_stop，只训练不验证）
+        pretrain_epochs = self.rec_optim_opt.get('pretrain_epochs', 10)
+        logger.info(f'[Pretraining main model for {pretrain_epochs} epochs]')
+        for epoch in range(pretrain_epochs):
+            self.evaluator.reset_metrics()
+            logger.info(f'[Pretrain epoch {epoch}]')
+            for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
+                self.step(batch, stage='rec', mode='train')
+            self.evaluator.report(epoch=epoch, mode='train')
+        
+        # 重置 early_stop 状态，准备交叉训练
+        self.best_metric = None
+        
+        # 交叉训练阶段：交替训练 ViewLearner 和主模型
+        logger.info('[Starting alternating training]')
         for epoch in range(self.rec_epoch):
             self.evaluator.reset_metrics()
             logger.info(f'[Recommendation epoch {str(epoch)}]')
