@@ -77,6 +77,13 @@ class HyCoRecSystem(BaseSystem):
         self.view_learner_entity = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
         self.view_learner_word = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
 
+    def _get_model(self):
+        """获取原始模型（处理 DataParallel 包装）"""
+        if os.environ.get("CUDA_VISIBLE_DEVICES") == '-1':
+            return self.model
+        else:
+            return self.model.module
+
     def rec_evaluate(self, rec_predict, item_label):
         rec_predict = rec_predict.cpu()
         rec_predict = rec_predict[:, self.item_ids]
@@ -261,7 +268,7 @@ class HyCoRecSystem(BaseSystem):
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
         # 3. 事实预测（带学习到的权重）
-        rec_loss_f, scores_f, weight_info = self.model.recommend_with_weight_fn(
+        rec_loss_f, scores_f, weight_info = self._get_model().recommend_with_weight_fn(
             batch, 'train',
             item_weight_fn=item_weight_fn,
             entity_weight_fn=entity_weight_fn,
@@ -282,7 +289,7 @@ class HyCoRecSystem(BaseSystem):
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
         
-        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight_fn(
+        rec_loss_cf, scores_cf, _ = self._get_model().recommend_with_weight_fn(
             batch, 'train',
             item_weight_fn=item_cf_fn,
             entity_weight_fn=entity_cf_fn,
@@ -355,7 +362,7 @@ class HyCoRecSystem(BaseSystem):
         entity_weight_fn = make_weight_fn(self.view_learner_entity)
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
-        rec_loss_f, scores_f, _ = self.model.recommend_with_weight_fn(
+        rec_loss_f, scores_f, _ = self._get_model().recommend_with_weight_fn(
             batch, 'train',
             item_weight_fn=item_weight_fn,
             entity_weight_fn=entity_weight_fn,
@@ -376,7 +383,7 @@ class HyCoRecSystem(BaseSystem):
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
         
-        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight_fn(
+        rec_loss_cf, scores_cf, _ = self._get_model().recommend_with_weight_fn(
             batch, 'train',
             item_weight_fn=item_cf_fn,
             entity_weight_fn=entity_cf_fn,
