@@ -36,6 +36,21 @@ rec:
   optimizer:
     name: Adam
     lr: !!float 1e-3
+  # ===== 预训练配置 =====
+  pretrain_epochs: 10                    # 预训练轮数
+  pretrain_model_path: null              # 预训练模型路径，设置后跳过预训练直接加载
+  # pretrain_model_path: "./pretrain_models/hycorec_ReDial_pretrain.pth"  # 示例：加载已有模型
+  save_pretrain_model: true              # 预训练后是否保存模型
+  pretrain_save_path: "./pretrain_models"  # 预训练模型保存目录
+  # ===== ViewLearner 配置 =====
+  use_counterfactual: true               # 是否使用反事实训练
+  view_lr: !!float 1e-2                  # ViewLearner 学习率
+  view_wd: !!float 1e-3                  # ViewLearner 权重衰减
+  view_alpha: 0.5                        # factual vs counterfactual 权重
+  view_lambda: 5.0                       # 边权重正则化系数
+  model_lambda: 0.1                      # 主模型对比损失权重
+  gamma: 0.5                             # hinge loss margin
+  temperature: 1.0                       # gumbel softmax 温度
 conv:
   epoch: 1
   batch_size: 128

@@ -64,6 +64,13 @@ class HyCoRecSystem(BaseSystem):
         self.temperature = self.rec_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
         self.use_counterfactual = self.rec_optim_opt.get('use_counterfactual', True)
         
+        # 预训练模型加载配置
+        # pretrain_model_path: 预训练模型路径，如果指定则跳过预训练直接加载
+        # save_pretrain_model: 是否在预训练后保存模型
+        self.pretrain_model_path = self.rec_optim_opt.get('pretrain_model_path', None)
+        self.save_pretrain_model = self.rec_optim_opt.get('save_pretrain_model', True)
+        self.pretrain_save_path = self.rec_optim_opt.get('pretrain_save_path', './pretrain_models')
+        
         # 构建 ViewLearner（为三种超图各一个）
         # 注意：ViewLearner 需要能直接处理节点特征和超边索引
         self.view_learner_item = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
@@ -140,15 +147,26 @@ class HyCoRecSystem(BaseSystem):
         )
         self.view_optimizer = torch.optim.Adam(view_params, lr=self.view_lr, weight_decay=self.view_wd)
 
-        # 预训练阶段：用10个epoch初始化主模型（不用early_stop，只训练不验证）
-        pretrain_epochs = self.rec_optim_opt.get('pretrain_epochs', 10)
-        logger.info(f'[Pretraining main model for {pretrain_epochs} epochs]')
-        for epoch in range(pretrain_epochs):
-            self.evaluator.reset_metrics()
-            logger.info(f'[Pretrain epoch {epoch}]')
-            for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
-                self.step(batch, stage='rec', mode='train')
-            self.evaluator.report(epoch=epoch, mode='train')
+        # ==================== 预训练阶段 ====================
+        # 根据配置决定是预训练还是加载已有模型
+        if self.pretrain_model_path and os.path.exists(self.pretrain_model_path):
+            # 加载已有的预训练模型
+            logger.info(f'[Loading pretrained model from {self.pretrain_model_path}]')
+            self._load_pretrain_model(self.pretrain_model_path)
+        else:
+            # 执行预训练
+            pretrain_epochs = self.rec_optim_opt.get('pretrain_epochs', 10)
+            logger.info(f'[Pretraining main model for {pretrain_epochs} epochs]')
+            for epoch in range(pretrain_epochs):
+                self.evaluator.reset_metrics()
+                logger.info(f'[Pretrain epoch {epoch}]')
+                for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
+                    self.step(batch, stage='rec', mode='train')
+                self.evaluator.report(epoch=epoch, mode='train')
+            
+            # 预训练后保存模型
+            if self.save_pretrain_model:
+                self._save_pretrain_model()
         
         # 重置 early_stop 状态，准备交叉训练
         self.best_metric = None
@@ -454,3 +472,29 @@ class HyCoRecSystem(BaseSystem):
 
     def interact(self):
         pass
+
+    def _save_pretrain_model(self):
+        """保存预训练后的主模型"""
+        os.makedirs(self.pretrain_save_path, exist_ok=True)
+        model_name = self.opt.get('model_name', 'hycorec')
+        dataset_name = self.opt.get('dataset', 'unknown')
+        save_file = os.path.join(self.pretrain_save_path, f'{model_name}_{dataset_name}_pretrain.pth')
+        
+        if os.environ.get("CUDA_VISIBLE_DEVICES") == '-1':
+            state_dict = self.model.state_dict()
+        else:
+            state_dict = self.model.module.state_dict()
+        
+        torch.save(state_dict, save_file)
+        logger.info(f'[Pretrained model saved to {save_file}]')
+
+    def _load_pretrain_model(self, load_path):
+        """加载预训练的主模型"""
+        state_dict = torch.load(load_path, map_location=self.device)
+        
+        if os.environ.get("CUDA_VISIBLE_DEVICES") == '-1':
+            self.model.load_state_dict(state_dict)
+        else:
+            self.model.module.load_state_dict(state_dict)
+        
+        logger.info(f'[Pretrained model loaded from {load_path}]')
