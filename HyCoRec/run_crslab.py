@@ -36,8 +36,29 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--seed', type=int, default=2020)
     parser.add_argument('-p', '--pretrain', action='store_true', help='use pretrain weights')
     parser.add_argument('-e', '--pretrain_epoch', type=int, default=9999, help='pretrain epoch')
+    parser.add_argument('--use_wandb', action='store_true', help='enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default=None, help='wandb project name')
+    parser.add_argument('--wandb_name', type=str, default=None, help='wandb run name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity/team')
+    parser.add_argument('--wandb_group', type=str, default=None, help='wandb group name')
+    parser.add_argument('--wandb_tags', type=str, default=None, help='comma-separated wandb tags')
+    parser.add_argument('--wandb_mode', type=str, default=None, help='wandb mode: online/offline/disabled')
     args, _ = parser.parse_known_args()
     config = Config(args.config, args.gpu, args.debug, args.seed, args.pretrain, args.pretrain_epoch)
+    if args.use_wandb:
+        config['use_wandb'] = True
+    if args.wandb_project:
+        config['wandb_project'] = args.wandb_project
+    if args.wandb_name:
+        config['wandb_name'] = args.wandb_name
+    if args.wandb_entity:
+        config['wandb_entity'] = args.wandb_entity
+    if args.wandb_group:
+        config['wandb_group'] = args.wandb_group
+    if args.wandb_tags:
+        config['wandb_tags'] = [tag.strip() for tag in args.wandb_tags.split(',') if tag.strip()]
+    if args.wandb_mode:
+        config['wandb_mode'] = args.wandb_mode
 
     from crslab.quick_start import run_crslab
 

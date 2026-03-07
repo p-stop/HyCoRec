@@ -5,6 +5,7 @@
 
 import os
 import json
+import atexit
 from time import perf_counter
 import torch
 import torch.nn as nn
@@ -16,6 +17,11 @@ from crslab.evaluator.metrics.gen import PPLMetric
 from crslab.system.base import BaseSystem
 from crslab.system.utils.functions import ind2txt
 from crslab.model.crs.hycorec.hycorec import ViewLearner
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def gumbel_softmax(logits, temperature=1.0):
@@ -76,6 +82,64 @@ class HyCoRecSystem(BaseSystem):
         self.view_learner_item = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
         self.view_learner_entity = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
         self.view_learner_word = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
+        self._wandb_run = None
+        self._setup_wandb()
+
+    def _setup_wandb(self):
+        self._wandb_enabled = bool(self.opt.get('use_wandb', False))
+        if not self._wandb_enabled:
+            return
+        if wandb is None:
+            logger.warning('[wandb not installed] Please run `pip install wandb` to enable tracking.')
+            self._wandb_enabled = False
+            return
+
+        init_kwargs = {
+            'project': self.opt.get('wandb_project', 'HyCoRec'),
+            'config': dict(self.opt)
+        }
+        if self.opt.get('wandb_name'):
+            init_kwargs['name'] = self.opt['wandb_name']
+        if self.opt.get('wandb_entity'):
+            init_kwargs['entity'] = self.opt['wandb_entity']
+        if self.opt.get('wandb_group'):
+            init_kwargs['group'] = self.opt['wandb_group']
+        if self.opt.get('wandb_tags'):
+            init_kwargs['tags'] = self.opt['wandb_tags']
+        if self.opt.get('wandb_mode'):
+            init_kwargs['mode'] = self.opt['wandb_mode']
+
+        self._wandb_run = wandb.init(**init_kwargs)
+        atexit.register(self._finish_wandb)
+        logger.info('[wandb initialized]')
+
+    def _log_wandb_from_evaluator(self, stage, epoch=None):
+        if not self._wandb_enabled or self._wandb_run is None:
+            return
+        if not hasattr(self, 'evaluator') or not self.evaluator.result_data:
+            return
+
+        report_data = self.evaluator.result_data[-1]
+        mode = report_data.get('mode', 'unknown')
+        report = report_data.get('report', {})
+
+        metrics = {}
+        for key, value in report.items():
+            if isinstance(value, (int, float)):
+                metrics[f'{stage}/{mode}/{key}'] = value
+
+        if not metrics:
+            return
+        if epoch is not None and epoch >= 0:
+            metrics[f'{stage}/epoch'] = epoch
+            self._wandb_run.log(metrics, step=epoch)
+        else:
+            self._wandb_run.log(metrics)
+
+    def _finish_wandb(self):
+        if self._wandb_run is not None:
+            self._wandb_run.finish()
+            self._wandb_run = None
 
     def _get_model(self):
         """获取原始模型（处理 DataParallel 包装）"""
@@ -170,6 +234,7 @@ class HyCoRecSystem(BaseSystem):
                 for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
                     self.step(batch, stage='rec', mode='train')
                 self.evaluator.report(epoch=epoch, mode='train')
+                self._log_wandb_from_evaluator(stage='pretrain_rec', epoch=epoch)
             
             # 预训练后保存模型
             if self.save_pretrain_model:
@@ -207,6 +272,7 @@ class HyCoRecSystem(BaseSystem):
                     self.step(batch, stage='rec', mode='train')
             
             self.evaluator.report(epoch=epoch, mode='train')
+            self._log_wandb_from_evaluator(stage='rec', epoch=epoch)
             
             # val
             logger.info('[Valid]')
@@ -215,6 +281,7 @@ class HyCoRecSystem(BaseSystem):
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                     self.step(batch, stage='rec', mode='valid')
                 self.evaluator.report(epoch=epoch, mode='valid')
+                self._log_wandb_from_evaluator(stage='rec', epoch=epoch)
                 # early stop
                 metric = self.evaluator.optim_metrics['rec_loss']
                 if self.early_stop(metric):
@@ -227,6 +294,7 @@ class HyCoRecSystem(BaseSystem):
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                 self.step(batch, stage='rec', mode='test')
             self.evaluator.report(mode='test')
+            self._log_wandb_from_evaluator(stage='rec')
 
     def train_view_learner_step(self, batch):
         """
@@ -454,6 +522,7 @@ class HyCoRecSystem(BaseSystem):
             for batch in self.train_dataloader.get_conv_data(batch_size=self.conv_batch_size):
                 self.step(batch, stage='conv', mode='train')
             self.evaluator.report(epoch=epoch, mode='train')
+            self._log_wandb_from_evaluator(stage='conv', epoch=epoch)
             # val
             logger.info('[Valid]')
             with torch.no_grad():
@@ -461,6 +530,7 @@ class HyCoRecSystem(BaseSystem):
                 for batch in self.valid_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
                     self.step(batch, stage='conv', mode='valid')
                 self.evaluator.report(epoch=epoch, mode='valid')
+                self._log_wandb_from_evaluator(stage='conv', epoch=epoch)
                 # early stop
                 metric = self.evaluator.optim_metrics['gen_loss']
                 if self.early_stop(metric):
@@ -472,10 +542,14 @@ class HyCoRecSystem(BaseSystem):
             for batch in self.test_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
                 self.step(batch, stage='conv', mode='test')
             self.evaluator.report(mode='test')
+            self._log_wandb_from_evaluator(stage='conv')
 
     def fit(self):
-        self.train_recommender()
-        self.train_conversation()
+        try:
+            self.train_recommender()
+            self.train_conversation()
+        finally:
+            self._finish_wandb()
 
     def interact(self):
         pass

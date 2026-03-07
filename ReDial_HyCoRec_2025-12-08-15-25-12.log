@@ -1,0 +1,165 @@
+2025-12-08 15:25:12.496 | INFO     | crslab.config.config:__init__:87 - [Dataset: ReDial tokenized in nltk]
+2025-12-08 15:25:12.497 | INFO     | crslab.config.config:__init__:89 - [Model: HyCoRec]
+2025-12-08 15:25:12.497 | INFO     | crslab.config.config:__init__:96 - [Config]/n{
+    "dataset": "ReDial",
+    "tokenize": "nltk",
+    "related_truncate": 1024,
+    "context_truncate": 256,
+    "response_truncate": 30,
+    "scale": 1,
+    "model": "HyCoRec",
+    "token_emb_dim": 300,
+    "kg_emb_dim": 128,
+    "num_bases": 8,
+    "n_heads": 2,
+    "n_layers": 2,
+    "ffn_size": 300,
+    "dropout": 0.1,
+    "attention_dropout": 0.0,
+    "relu_dropout": 0.1,
+    "learn_positional_embeddings": false,
+    "embeddings_scale": true,
+    "reduction": false,
+    "n_positions": 1024,
+    "user_proj_dim": 512,
+    "mha_n_heads": 4,
+    "pooling": "Mean",
+    "extension_strategy": "Adaptive",
+    "rec": {
+        "epoch": 10,
+        "batch_size": 256,
+        "early_stop": true,
+        "stop_mode": "min",
+        "impatience": 2,
+        "optimizer": {
+            "name": "Adam",
+            "lr": 0.001
+        },
+        "pretrain_epochs": 1,
+        "pretrain_model_path": "./pretrain_models/ReDial_1epoch.pth",
+        "save_pretrain_model": true,
+        "pretrain_save_path": "./pretrain_models",
+        "use_counterfactual": true,
+        "view_lr": 0.01,
+        "view_wd": 0.001,
+        "view_alpha": 0.5,
+        "view_lambda": 5.0,
+        "model_lambda": 0.1,
+        "gamma": 0.5,
+        "temperature": 1.0
+    },
+    "conv": {
+        "epoch": 5,
+        "batch_size": 128,
+        "impatience": 1,
+        "optimizer": {
+            "name": "Adam",
+            "lr": 0.001
+        },
+        "lr_scheduler": {
+            "name": "ReduceLROnPlateau",
+            "patience": 3,
+            "factor": 0.5
+        },
+        "gradient_clip": 0.1
+    },
+    "pretrain": false,
+    "pretrain_epoch": 9999,
+    "gpu": [
+        0
+    ],
+    "model_name": "HyCoRec",
+    "rankfile": "HyCoRec-ReDial.json"
+}
+2025-12-08 15:25:16.739 | INFO     | crslab.data.dataset.base:__init__:49 - [Finish data load]
+2025-12-08 15:25:20.881 | INFO     | crslab.data.dataset.base:__init__:55 - [Finish data preprocess]
+2025-12-08 15:25:22.180 | INFO     | crslab.model.crs.hycorec.hycorec:_build_adjacent_matrix:218 - [Adjacent Matrix built.]
+2025-12-08 15:25:23.351 | INFO     | crslab.model:get_model:27 - [Build model HyCoRec]
+2025-12-08 15:25:23.406 | INFO     | crslab.evaluator:get_evaluator:25 - [Build evaluator standard]
+2025-12-08 15:25:23.410 | INFO     | crslab.system:get_system:32 - [Build system HyCoRec]
+2025-12-08 15:25:23.411 | INFO     | crslab.system.base:build_optimizer:138 - [Build optimizer: Adam]
+2025-12-08 15:25:23.412 | INFO     | crslab.system.hycorec:train_recommender:161 - [Loading pretrained model from ./pretrain_models/ReDial_1epoch.pth]
+2025-12-08 15:25:23.592 | INFO     | crslab.system.hycorec:_load_pretrain_model:507 - [Pretrained model loaded from ./pretrain_models/ReDial_1epoch.pth]
+2025-12-08 15:25:23.593 | INFO     | crslab.system.hycorec:train_recommender:182 - [Starting alternating training]
+2025-12-08 15:25:23.593 | INFO     | crslab.system.hycorec:train_recommender:185 - [Recommendation epoch 0]
+2025-12-08 15:25:23.593 | INFO     | crslab.system.hycorec:train_recommender:192 - [Train]
+2025-12-08 15:44:03.110 | INFO     | crslab.evaluator.standard:report:76 - 
+{"grad norm": 11.67, "rec_loss": 6.726, "view_loss": 3.45}
+2025-12-08 15:44:03.111 | INFO     | crslab.system.hycorec:train_recommender:212 - [Valid]
+2025-12-08 15:44:10.632 | INFO     | crslab.evaluator.standard:report:76 - 
+{"mrr@1": 0.03787, "mrr@10": 0.0831, "mrr@50": 0.09195, "ndcg@1": 0.03787, "ndcg@10": 0.1136, "ndcg@50": 0.1553, "rec_loss": 6.94, "recall@1": 0.03787, "recall@10": 0.2136, "recall@50": 0.403}
+2025-12-08 15:44:10.632 | INFO     | crslab.system.base:early_stop:249 - [Get new best model]
+2025-12-08 15:44:10.632 | INFO     | crslab.system.hycorec:train_recommender:185 - [Recommendation epoch 1]
+2025-12-08 15:44:10.632 | INFO     | crslab.system.hycorec:train_recommender:192 - [Train]
+2025-12-08 16:02:05.683 | INFO     | crslab.evaluator.standard:report:76 - 
+{"grad norm": 8.73, "rec_loss": 6.162, "view_loss": 1.705}
+2025-12-08 16:02:05.683 | INFO     | crslab.system.hycorec:train_recommender:212 - [Valid]
+2025-12-08 16:02:13.054 | INFO     | crslab.evaluator.standard:report:76 - 
+{"mrr@1": 0.04252, "mrr@10": 0.08766, "mrr@50": 0.09775, "ndcg@1": 0.04252, "ndcg@10": 0.1197, "ndcg@50": 0.1667, "rec_loss": 6.744, "recall@1": 0.04252, "recall@10": 0.2259, "recall@50": 0.4385}
+2025-12-08 16:02:13.054 | INFO     | crslab.system.base:early_stop:249 - [Get new best model]
+2025-12-08 16:02:13.054 | INFO     | crslab.system.hycorec:train_recommender:185 - [Recommendation epoch 2]
+2025-12-08 16:02:13.054 | INFO     | crslab.system.hycorec:train_recommender:192 - [Train]
+2025-12-08 16:18:20.432 | INFO     | crslab.evaluator.standard:report:76 - 
+{"grad norm": 6.914, "rec_loss": 5.739, "view_loss": 1.339}
+2025-12-08 16:18:20.432 | INFO     | crslab.system.hycorec:train_recommender:212 - [Valid]
+2025-12-08 16:18:27.749 | INFO     | crslab.evaluator.standard:report:76 - 
+{"mrr@1": 0.04419, "mrr@10": 0.09133, "mrr@50": 0.102, "ndcg@1": 0.04419, "ndcg@10": 0.1236, "ndcg@50": 0.1736, "rec_loss": 6.709, "recall@1": 0.04419, "recall@10": 0.2299, "recall@50": 0.4561}
+2025-12-08 16:18:27.751 | INFO     | crslab.system.base:early_stop:249 - [Get new best model]
+2025-12-08 16:18:27.751 | INFO     | crslab.system.hycorec:train_recommender:185 - [Recommendation epoch 3]
+2025-12-08 16:18:27.751 | INFO     | crslab.system.hycorec:train_recommender:192 - [Train]
+2025-12-08 16:34:29.618 | INFO     | crslab.evaluator.standard:report:76 - 
+{"grad norm": 6.966, "rec_loss": 5.401, "view_loss": 1.472}
+2025-12-08 16:34:29.618 | INFO     | crslab.system.hycorec:train_recommender:212 - [Valid]
+2025-12-08 16:34:36.821 | INFO     | crslab.evaluator.standard:report:76 - 
+{"mrr@1": 0.04053, "mrr@10": 0.09042, "mrr@50": 0.1006, "ndcg@1": 0.04053, "ndcg@10": 0.1255, "ndcg@50": 0.1724, "rec_loss": 6.729, "recall@1": 0.04053, "recall@10": 0.2415, "recall@50": 0.4525}
+2025-12-08 16:34:36.822 | INFO     | crslab.system.hycorec:train_recommender:185 - [Recommendation epoch 4]
+2025-12-08 16:34:36.822 | INFO     | crslab.system.hycorec:train_recommender:192 - [Train]
+2025-12-08 16:50:39.873 | INFO     | crslab.evaluator.standard:report:76 - 
+{"grad norm": 9.999, "rec_loss": 5.142, "view_loss": 1.556}
+2025-12-08 16:50:39.873 | INFO     | crslab.system.hycorec:train_recommender:212 - [Valid]
+2025-12-08 16:50:46.858 | INFO     | crslab.evaluator.standard:report:76 - 
+{"mrr@1": 0.03355, "mrr@10": 0.07667, "mrr@50": 0.08616, "ndcg@1": 0.03355, "ndcg@10": 0.1067, "ndcg@50": 0.151, "rec_loss": 6.977, "recall@1": 0.03355, "recall@10": 0.205, "recall@50": 0.4056}
+2025-12-08 16:50:46.858 | INFO     | crslab.system.base:early_stop:254 - [Early stop]
+2025-12-08 16:50:46.858 | INFO     | crslab.system.hycorec:train_recommender:224 - [Test]
+2025-12-08 16:50:56.395 | INFO     | crslab.evaluator.standard:report:76 - 
+{"mrr@1": 0.02448, "mrr@10": 0.0629, "mrr@50": 0.07128, "ndcg@1": 0.02448, "ndcg@10": 0.08872, "ndcg@50": 0.1274, "rec_loss": 7.547, "recall@1": 0.02448, "recall@10": 0.1731, "recall@50": 0.3475}
+2025-12-08 16:50:56.397 | INFO     | crslab.system.base:build_optimizer:138 - [Build optimizer: Adam]
+2025-12-08 16:50:56.397 | INFO     | crslab.system.base:build_lr_scheduler:155 - [Build scheduler ReduceLROnPlateau]
+2025-12-08 16:50:56.397 | INFO     | crslab.system.hycorec:train_conversation:452 - [Conversation epoch 0]
+2025-12-08 16:50:56.397 | INFO     | crslab.system.hycorec:train_conversation:453 - [Train]
+2025-12-08 16:54:59.075 | INFO     | crslab.evaluator.standard:report:76 - 
+{"gen_loss": 4.635, "grad clip ratio": 1.0, "grad norm": 5.414, "ppl": 103.0}
+2025-12-08 16:54:59.075 | INFO     | crslab.system.hycorec:train_conversation:458 - [Valid]
+2025-12-08 16:55:21.634 | INFO     | crslab.evaluator.standard:report:76 - 
+{"bleu@1": 0.2502, "bleu@2": 0.0583, "bleu@3": 0.02285, "bleu@4": 0.01314, "dist@1": 0.03645, "dist@2": 0.6373, "dist@3": 3.009, "dist@4": 6.362, "f1": 0.3297, "gen_loss": 4.011, "ppl": 55.23}
+2025-12-08 16:55:21.640 | INFO     | crslab.system.hycorec:train_conversation:452 - [Conversation epoch 1]
+2025-12-08 16:55:21.640 | INFO     | crslab.system.hycorec:train_conversation:453 - [Train]
+2025-12-08 16:59:25.829 | INFO     | crslab.evaluator.standard:report:76 - 
+{"gen_loss": 3.784, "grad clip ratio": 1.0, "grad norm": 2.881, "ppl": 44.01}
+2025-12-08 16:59:25.830 | INFO     | crslab.system.hycorec:train_conversation:458 - [Valid]
+2025-12-08 16:59:48.745 | INFO     | crslab.evaluator.standard:report:76 - 
+{"bleu@1": 0.2725, "bleu@2": 0.0699, "bleu@3": 0.0278, "bleu@4": 0.01478, "dist@1": 0.05418, "dist@2": 0.8091, "dist@3": 3.365, "dist@4": 6.567, "f1": 0.3516, "gen_loss": 3.792, "ppl": 44.33}
+2025-12-08 16:59:48.751 | INFO     | crslab.system.hycorec:train_conversation:452 - [Conversation epoch 2]
+2025-12-08 16:59:48.751 | INFO     | crslab.system.hycorec:train_conversation:453 - [Train]
+2025-12-08 17:03:49.527 | INFO     | crslab.evaluator.standard:report:76 - 
+{"gen_loss": 3.506, "grad clip ratio": 1.0, "grad norm": 2.419, "ppl": 33.31}
+2025-12-08 17:03:49.528 | INFO     | crslab.system.hycorec:train_conversation:458 - [Valid]
+2025-12-08 17:04:13.074 | INFO     | crslab.evaluator.standard:report:76 - 
+{"bleu@1": 0.2732, "bleu@2": 0.07115, "bleu@3": 0.02742, "bleu@4": 0.01446, "dist@1": 0.08215, "dist@2": 1.012, "dist@3": 3.549, "dist@4": 6.542, "f1": 0.3495, "gen_loss": 3.711, "ppl": 40.9}
+2025-12-08 17:04:13.080 | INFO     | crslab.system.hycorec:train_conversation:452 - [Conversation epoch 3]
+2025-12-08 17:04:13.080 | INFO     | crslab.system.hycorec:train_conversation:453 - [Train]
+2025-12-08 17:08:15.404 | INFO     | crslab.evaluator.standard:report:76 - 
+{"gen_loss": 3.282, "grad clip ratio": 1.0, "grad norm": 2.235, "ppl": 26.64}
+2025-12-08 17:08:15.404 | INFO     | crslab.system.hycorec:train_conversation:458 - [Valid]
+2025-12-08 17:08:38.446 | INFO     | crslab.evaluator.standard:report:76 - 
+{"bleu@1": 0.2884, "bleu@2": 0.07593, "bleu@3": 0.02958, "bleu@4": 0.01555, "dist@1": 0.1162, "dist@2": 1.211, "dist@3": 4.069, "dist@4": 7.197, "f1": 0.3618, "gen_loss": 3.677, "ppl": 39.52}
+2025-12-08 17:08:38.454 | INFO     | crslab.system.hycorec:train_conversation:452 - [Conversation epoch 4]
+2025-12-08 17:08:38.454 | INFO     | crslab.system.hycorec:train_conversation:453 - [Train]
+2025-12-08 17:12:41.854 | INFO     | crslab.evaluator.standard:report:76 - 
+{"gen_loss": 3.084, "grad clip ratio": 1.0, "grad norm": 2.115, "ppl": 21.85}
+2025-12-08 17:12:41.854 | INFO     | crslab.system.hycorec:train_conversation:458 - [Valid]
+2025-12-08 17:13:05.293 | INFO     | crslab.evaluator.standard:report:76 - 
+{"bleu@1": 0.2897, "bleu@2": 0.08202, "bleu@3": 0.03793, "bleu@4": 0.02162, "dist@1": 0.1675, "dist@2": 1.47, "dist@3": 4.576, "dist@4": 7.76, "f1": 0.3624, "gen_loss": 3.721, "ppl": 41.29}
+2025-12-08 17:13:05.294 | INFO     | crslab.system.hycorec:train_conversation:469 - [Test]
+2025-12-08 17:13:42.289 | INFO     | crslab.evaluator.standard:report:76 - 
+{"bleu@1": 0.1848, "bleu@2": 0.04406, "bleu@3": 0.02167, "bleu@4": 0.01243, "dist@1": 0.07718, "dist@2": 0.3027, "dist@3": 0.6455, "dist@4": 1.131, "f1": 0.2438}
