@@ -94,9 +94,16 @@ class HyCoRecSystem(BaseSystem):
             self._wandb_enabled = False
             return
 
+        if hasattr(self.opt, 'opt') and isinstance(self.opt.opt, dict):
+            wandb_config = dict(self.opt.opt)
+        elif isinstance(self.opt, dict):
+            wandb_config = dict(self.opt)
+        else:
+            wandb_config = {}
+
         init_kwargs = {
             'project': self.opt.get('wandb_project', 'HyCoRec'),
-            'config': dict(self.opt)
+            'config': wandb_config
         }
         if self.opt.get('wandb_name'):
             init_kwargs['name'] = self.opt['wandb_name']
