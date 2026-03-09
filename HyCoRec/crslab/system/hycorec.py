@@ -298,23 +298,32 @@ class HyCoRecSystem(BaseSystem):
         word_aug_weight_mean = word_node_prob.mean()
         
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
-        view_loss = (self.view_alpha * loss_f + 
+        item_view_loss = (self.view_alpha * loss_f + 
                      (1 - self.view_alpha) * loss_cf + 
-                     self.view_lambda * aug_weight_mean)
-        
-        # 8. 更新 ViewLearner
-        self.view_optimizer.zero_grad()
+                     self.view_lambda * item_aug_weight_mean)
+        entity_view_loss = (self.view_alpha * loss_f +
+                        (1 - self.view_alpha) * loss_cf +
+                        self.view_lambda * entity_aug_weight_mean)
+        word_view_loss = (self.view_alpha * loss_f +
+                        (1 - self.view_alpha) * loss_cf +
+                        self.view_lambda * word_aug_weight_mean)
+        view_loss = item_view_loss + entity_view_loss + word_view_loss
+        # 8. 更新 ViewLearner（一次 backward）
+        self.view_optimizer.zero_grad(set_to_none=True)
         view_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.view_learner_item.parameters()) + 
-            list(self.view_learner_entity.parameters()) + 
-            list(self.view_learner_word.parameters()), 
+            list(self.view_learner_item.parameters()) +
+            list(self.view_learner_entity.parameters()) +
+            list(self.view_learner_word.parameters()),
             1.0
         )
         self.view_optimizer.step()
-        
-        # 记录指标
+
+        # 记录指标（分别记录更清晰）
         self.evaluator.optim_metrics.add("view_loss", AverageMetric(view_loss.item()))
+        self.evaluator.optim_metrics.add("item_view_loss", AverageMetric(item_view_loss.item()))
+        self.evaluator.optim_metrics.add("entity_view_loss", AverageMetric(entity_view_loss.item()))
+        self.evaluator.optim_metrics.add("word_view_loss", AverageMetric(word_view_loss.item()))
 
     def train_main_model_step(self, batch):
         """
