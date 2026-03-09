@@ -273,15 +273,15 @@ class HyCoRecSystem(BaseSystem):
         }
         
         # 3. 事实预测（带学习到的权重）
-        rec_loss_f, scores_f, _ = self.model().recommend_with_weight_fn(
-            batch, 'train',
+        rec_loss_f, scores_f, _ = self.model.forward(
+            batch, 'train','rec',
             weight=f_weight_info
         )
         
         # 4. 反事实预测（权重取反）
 
-        rec_loss_cf, scores_cf, _ = self.model().recommend_with_weight_fn(
-            batch, 'train',
+        rec_loss_cf, scores_cf, _ = self.model.forward(
+            batch, 'train','rec',
             weight=cf_weight_info
         )
         
@@ -341,52 +341,48 @@ class HyCoRecSystem(BaseSystem):
         self.view_learner_word.eval()
         
         # 1. 原始预测（不带权重）
-        rec_loss_orig, scores_orig = self.model.forward(batch, 'train', 'rec')
+        with torch.no_grad():
+            rec_loss_orig, scores_orig = self.model.forward(batch, 'train', 'rec')
         
-        # 2. 事实预测（带 ViewLearner 生成的权重）
-        def make_weight_fn(view_learner):
-            def fn(node_features, hyper_edge_index):
-                with torch.no_grad():  # ViewLearner 不更新
-                    weight_logits = view_learner(node_features, hyper_edge_index)
-                weight = gumbel_softmax(weight_logits.detach(), self.temperature)
-                return weight, weight_logits.detach()
-            return fn
+        # 2. 获取 RGCN 编码后的嵌入（用于 ViewLearner）
         
-        item_weight_fn = make_weight_fn(self.view_learner_item)
-        entity_weight_fn = make_weight_fn(self.view_learner_entity)
-        word_weight_fn = make_weight_fn(self.view_learner_word)
+        item_node_weight = self.view_learner_item(batch)
+        entity_node_weight = self.view_learner_entity(batch)
+        word_node_weight = self.view_learner_word(batch)
+
+        item_node_prob = gumbel_softmax(item_node_weight,temperature=self.temperature)
+        entity_node_prob = gumbel_softmax(entity_node_weight,temperature=self.temperature)
+        word_node_prob = gumbel_softmax(word_node_weight,temperature=self.temperature)
+
+
+        f_weight_info = {
+            'item': item_node_prob,
+            'entity': entity_node_prob,
+            'word': word_node_prob
+        }
+
+        cf_weight_info = {
+            'item': 1 - item_node_prob,
+            'entity': 1 - entity_node_prob,
+            'word': 1 - word_node_prob
+        }
         
-        rec_loss_f, scores_f, _ = self._get_model().recommend_with_weight_fn(
-            batch, 'train',
-            item_weight_fn=item_weight_fn,
-            entity_weight_fn=entity_weight_fn,
-            word_weight_fn=word_weight_fn
+        # 3. 事实预测（带学习到的权重）
+        rec_loss_f, scores_f, _ = self.model.forward(
+            batch, 'train','rec',
+            weight=f_weight_info
         )
         
-        # 3. 反事实预测
-        def make_cf_weight_fn(view_learner):
-            def fn(node_features, hyper_edge_index):
-                with torch.no_grad():
-                    weight_logits = view_learner(node_features, hyper_edge_index)
-                weight = gumbel_softmax(weight_logits.detach(), self.temperature)
-                cf_weight = 1 - weight
-                return cf_weight, weight_logits.detach()
-            return fn
-        
-        item_cf_fn = make_cf_weight_fn(self.view_learner_item)
-        entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
-        word_cf_fn = make_cf_weight_fn(self.view_learner_word)
-        
-        rec_loss_cf, scores_cf, _ = self._get_model().recommend_with_weight_fn(
-            batch, 'train',
-            item_weight_fn=item_cf_fn,
-            entity_weight_fn=entity_cf_fn,
-            word_weight_fn=word_cf_fn
+        # 4. 反事实预测（权重取反）
+
+        rec_loss_cf, scores_cf, _ = self.model.forward(
+            batch, 'train','rec',
+            weight=cf_weight_info
         )
         
-        # 4. 计算事实/反事实损失
-        loss_f = self.factual_loss(scores_orig.detach(), scores_f)
-        loss_cf = self.counterfactual_loss(scores_orig.detach(), scores_cf)
+        # 5. 计算事实损失和反事实损失
+        loss_f = self.factual_loss(scores_orig, scores_f)
+        loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
         
         # 5. model_loss = rec_loss + λ_model * (α * loss_f + (1-α) * loss_cf)
         model_loss = rec_loss_orig + self.model_lambda * (
