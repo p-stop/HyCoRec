@@ -77,13 +77,6 @@ class HyCoRecSystem(BaseSystem):
         self.view_learner_entity = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
         self.view_learner_word = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
 
-    def _get_model(self):
-        """获取原始模型（处理 DataParallel 包装）"""
-        if os.environ.get("CUDA_VISIBLE_DEVICES") == '-1':
-            return self.model
-        else:
-            return self.model.module
-
     def rec_evaluate(self, rec_predict, item_label):
         rec_predict = rec_predict.cpu()
         rec_predict = rec_predict[:, self.item_ids]
@@ -248,11 +241,6 @@ class HyCoRecSystem(BaseSystem):
             rec_loss_orig, scores_orig = self.model.forward(batch, 'train', 'rec')
         
         # 2. 获取 RGCN 编码后的嵌入（用于 ViewLearner）
-        # 需要从模型中获取嵌入，然后构建超图，再调用 ViewLearner
-        # 这里简化处理：直接调用带权重的推荐方法，让权重在模型内部通过回调生成
-        
-        # 为了让 ViewLearner 能够生成权重，我们需要一种方式让模型内部调用 ViewLearner
-        # 方案：传入一个权重生成函数给模型
         
         def make_weight_fn(view_learner):
             """创建一个权重生成函数"""
@@ -263,37 +251,38 @@ class HyCoRecSystem(BaseSystem):
                 return weight, weight_logits  # 返回权重和 logits（用于正则化）
             return fn
         
-        item_weight_fn = make_weight_fn(self.view_learner_item)
-        entity_weight_fn = make_weight_fn(self.view_learner_entity)
-        word_weight_fn = make_weight_fn(self.view_learner_word)
+        item_node_weight = self.view_learner_item(batch)
+        entity_node_weight = self.view_learner_entity(batch)
+        word_node_weight = self.view_learner_word(batch)
+
+        item_node_prob = gumbel_softmax(item_node_weight,temperature=self.temperature)
+        entity_node_prob = gumbel_softmax(entity_node_weight,temperature=self.temperature)
+        word_node_prob = gumbel_softmax(word_node_weight,temperature=self.temperature)
+
+
+        f_weight_info = {
+            'item': item_node_prob,
+            'entity': entity_node_prob,
+            'word': word_node_prob
+        }
+
+        cf_weight_info = {
+            'item': 1 - item_node_prob,
+            'entity': 1 - entity_node_prob,
+            'word': 1 - word_node_prob
+        }
         
         # 3. 事实预测（带学习到的权重）
-        rec_loss_f, scores_f, weight_info = self._get_model().recommend_with_weight_fn(
+        rec_loss_f, scores_f, _ = self.model().recommend_with_weight_fn(
             batch, 'train',
-            item_weight_fn=item_weight_fn,
-            entity_weight_fn=entity_weight_fn,
-            word_weight_fn=word_weight_fn
+            weight=f_weight_info
         )
         
-        # 4. 反事实预测（用 1 - weight）
-        def make_cf_weight_fn(view_learner):
-            """创建反事实权重生成函数"""
-            def fn(node_features, hyper_edge_index):
-                weight_logits = view_learner(node_features, hyper_edge_index)
-                weight = gumbel_softmax(weight_logits, self.temperature)
-                cf_weight = 1 - weight  # 反事实权重
-                return cf_weight, weight_logits
-            return fn
-        
-        item_cf_fn = make_cf_weight_fn(self.view_learner_item)
-        entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
-        word_cf_fn = make_cf_weight_fn(self.view_learner_word)
-        
-        rec_loss_cf, scores_cf, _ = self._get_model().recommend_with_weight_fn(
+        # 4. 反事实预测（权重取反）
+
+        rec_loss_cf, scores_cf, _ = self.model().recommend_with_weight_fn(
             batch, 'train',
-            item_weight_fn=item_cf_fn,
-            entity_weight_fn=entity_cf_fn,
-            word_weight_fn=word_cf_fn
+            weight=cf_weight_info
         )
         
         # 5. 计算事实损失和反事实损失
@@ -301,16 +290,12 @@ class HyCoRecSystem(BaseSystem):
         loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
         
         # 6. 计算边权重正则化（鼓励保留更多边）
-        aug_weight_mean = 0.0
-        count = 0
-        for info in weight_info:
-            for key in ['item', 'entity', 'word']:
-                if info.get(key) is not None and info[key].get('logits') is not None:
-                    aug_weight = torch.sigmoid(info[key]['logits'])
-                    aug_weight_mean += torch.mean(aug_weight)
-                    count += 1
-        if count > 0:
-            aug_weight_mean = aug_weight_mean / count
+        # item_aug_weight_mean = item_node_weight.mean()
+        # entity_aug_weight_mean = entity_node_weight.mean()
+        # word_aug_weight_mean = word_node_weight.mean()
+        item_aug_weight_mean = item_node_prob.mean()
+        entity_aug_weight_mean = entity_node_prob.mean()
+        word_aug_weight_mean = word_node_prob.mean()
         
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
         view_loss = (self.view_alpha * loss_f + 
