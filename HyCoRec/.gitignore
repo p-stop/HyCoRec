@@ -1,0 +1,17 @@
+# 数据文件
+HyCoRec-ReDial.json
+HyCoRec-data.tar.xz
+visualize_log.py
+../uv.lock
+
+# 数据目录
+data/
+pretrain_models/
+log/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+
