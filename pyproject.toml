@@ -16,6 +16,7 @@ dependencies = [
     "torch-geometric>=2.6.1",
     "tqdm>=4.67.1",
     "transformers>=4.55.0",
+    "wandb>=0.19.0",
 ]
 
 [tool.uv.sources]

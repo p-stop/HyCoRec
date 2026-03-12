@@ -24,7 +24,7 @@ def gumbel_softmax(logits, temperature=1.0):
     eps = (bias - (1 - bias)) * torch.rand(logits.size(), device=logits.device) + (1 - bias)
     gate_inputs = torch.log(eps) - torch.log(1 - eps)
     gate_inputs = (gate_inputs + logits) / temperature
-    return torch.sigmoid(gate_inputs).squeeze()
+    return torch.sigmoid(gate_inputs).reshape(-1)
 
 
 class HyCoRecSystem(BaseSystem):
@@ -147,11 +147,13 @@ class HyCoRecSystem(BaseSystem):
         for epoch in range(self.rec_epoch):
             self.evaluator.reset_metrics()
             logger.info(f'[Recommendation epoch {str(epoch)}]')
+            self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
             # 每 50 个 epoch 衰减 view_lambda
             if (epoch + 1) % 50 == 0:
                 self.view_lambda *= 0.5
                 logger.info(f'[Decay view_lambda to {self.view_lambda}]')
+                self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
             logger.info('[Train]')
             for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
@@ -170,7 +172,8 @@ class HyCoRecSystem(BaseSystem):
                     # 不使用反事实推理，使用原始训练
                     self.step(batch, stage='rec', mode='train')
             
-            self.evaluator.report(epoch=epoch, mode='train')
+            train_report = self.evaluator.report(epoch=epoch, mode='train')
+            self.log_wandb_metrics(train_report, stage='rec', mode='train', epoch=epoch)
             
             # val
             logger.info('[Valid]')
@@ -178,7 +181,8 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                     self.step(batch, stage='rec', mode='valid')
-                self.evaluator.report(epoch=epoch, mode='valid')
+                valid_report = self.evaluator.report(epoch=epoch, mode='valid')
+                self.log_wandb_metrics(valid_report, stage='rec', mode='valid', epoch=epoch)
                 # early stop
                 metric = self.evaluator.optim_metrics['rec_loss']
                 if self.early_stop(metric):
@@ -190,7 +194,8 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                 self.step(batch, stage='rec', mode='test')
-            self.evaluator.report(mode='test')
+            test_report = self.evaluator.report(mode='test')
+            self.log_wandb_metrics(test_report, stage='rec', mode='test')
 
     def train_view_learner_step(self, batch):
         """
@@ -417,14 +422,16 @@ class HyCoRecSystem(BaseSystem):
             logger.info('[Train]')
             for batch in self.train_dataloader.get_conv_data(batch_size=self.conv_batch_size):
                 self.step(batch, stage='conv', mode='train')
-            self.evaluator.report(epoch=epoch, mode='train')
+            train_report = self.evaluator.report(epoch=epoch, mode='train')
+            self.log_wandb_metrics(train_report, stage='conv', mode='train', epoch=epoch)
             # val
             logger.info('[Valid]')
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
                     self.step(batch, stage='conv', mode='valid')
-                self.evaluator.report(epoch=epoch, mode='valid')
+                valid_report = self.evaluator.report(epoch=epoch, mode='valid')
+                self.log_wandb_metrics(valid_report, stage='conv', mode='valid', epoch=epoch)
                 # early stop
                 metric = self.evaluator.optim_metrics['gen_loss']
                 if self.early_stop(metric):
@@ -435,7 +442,8 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
                 self.step(batch, stage='conv', mode='test')
-            self.evaluator.report(mode='test')
+            test_report = self.evaluator.report(mode='test')
+            self.log_wandb_metrics(test_report, stage='conv', mode='test')
 
     def fit(self):
         self.train_recommender()
