@@ -70,6 +70,10 @@ class HyCoRecSystem(BaseSystem):
         self.view_learner_entity = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
         self.view_learner_word = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
 
+    def _core_model(self):
+        """Return the underlying model for both plain and DataParallel wrappers."""
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
     def rec_evaluate(self, rec_predict, item_label):
         rec_predict = rec_predict.cpu()
         rec_predict = rec_predict[:, self.item_ids]
@@ -228,7 +232,8 @@ class HyCoRecSystem(BaseSystem):
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
         # 3. 事实预测（带学习到的权重）
-        rec_loss_f, scores_f, weight_info = self.model.recommend_with_weight(
+        core_model = self._core_model()
+        rec_loss_f, scores_f, weight_info = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_weight_fn,
             entity_weight_fn=entity_weight_fn,
@@ -249,7 +254,7 @@ class HyCoRecSystem(BaseSystem):
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
         
-        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight(
+        rec_loss_cf, scores_cf, _ = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
             entity_weight_fn=entity_cf_fn,
@@ -320,7 +325,8 @@ class HyCoRecSystem(BaseSystem):
         entity_weight_fn = make_weight_fn(self.view_learner_entity)
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
-        rec_loss_f, scores_f, _ = self.model.recommend_with_weight(
+        core_model = self._core_model()
+        rec_loss_f, scores_f, _ = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_weight_fn,
             entity_weight_fn=entity_weight_fn,
@@ -341,7 +347,7 @@ class HyCoRecSystem(BaseSystem):
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
         
-        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight(
+        rec_loss_cf, scores_cf, _ = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
             entity_weight_fn=entity_cf_fn,
@@ -402,10 +408,7 @@ class HyCoRecSystem(BaseSystem):
         return loss
 
     def train_conversation(self):
-        if os.environ["CUDA_VISIBLE_DEVICES"] == '-1':
-            self.model.freeze_parameters()
-        else:
-            self.model.module.freeze_parameters()
+        self._core_model().freeze_parameters()
         self.init_optim(self.conv_optim_opt, self.model.parameters())
 
         for epoch in range(self.conv_epoch):
