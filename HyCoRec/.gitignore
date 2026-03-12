@@ -2,7 +2,7 @@
 HyCoRec-ReDial.json
 HyCoRec-data.tar.xz
 visualize_log.py
-../uv.lock
+
 
 # 数据目录
 data/

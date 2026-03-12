@@ -610,9 +610,22 @@ class HyCoRecModel(BaseModel):
             weight_info_list['item'].append(item_weight)
             weight_info_list['entity'].append(entity_weight)
             weight_info_list['word'].append(word_weight)
-        
+            # print("***************Weight Info (After Aggregation)***************")
+            # print({k: v.shape if v is not None else None for k, v in weight_info_list.items()})
+            # print("*****************************************************")
         user_embedding = torch.stack(user_repr_list, dim=0)
-        weight_info = {k: torch.stack(v, dim=0) for k, v in weight_info_list.items()}
+        weight_info = {}
+        for k, v_list in weight_info_list.items():
+            # Ignore None and merge all tensors under the same key to one 1-D tensor,
+            # so downstream code can safely call .mean().
+            tensors = [w.reshape(-1) for w in v_list if isinstance(w, torch.Tensor)]
+            if len(tensors) == 0:
+                weight_info[k] = torch.zeros(1, device=self.device)
+            else:
+                weight_info[k] = torch.cat(tensors, dim=0)
+        print("***************Weight Info (Final)***************")
+        print({k: v.shape if v is not None else None for k, v in weight_info.items()})
+        print("*****************************************************")
         return user_embedding, weight_info
 
     def encode_user_repr_with_weight(self, related_items, related_entities, related_words,
@@ -635,21 +648,22 @@ class HyCoRecModel(BaseModel):
             weight_info: dict，包含 item/entity/word 的权重信息
         """
         
-        # Item 超图
+        item_weight, entity_weight, word_weight = None, None, None
+        # print("***************Weight Info (Before Aggregation)***************")
+        # Item 超图        
         item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
         if len(related_items) > 0:
             items, item_hyper_edge_index = self._get_hypergraph(related_items, self.item_adj)
             sub_item_embedding, sub_item_edge_index, item_tot2sub = self._before_hyperconv(
                 tot_item_embedding, items, item_hyper_edge_index, self.item_adj
             )
-            
+            # print(related_items.shape if related_items is not None else None)
+            # print(item_hyper_edge_index if item_hyper_edge_index is not None else None)
+            # print(items if items is not None else None)
             hyperedge_weight = None
             if item_weight_fn is not None:
-                # 调用权重生成函数
-                edge_weight, weight_logits = item_weight_fn(sub_item_embedding, sub_item_edge_index)
                 # 将边权重聚合为超边权重（mean pooling）
                 hyperedge_weight ,item_weight = item_weight_fn(sub_item_embedding, sub_item_edge_index)
-            
             raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index, hyperedge_weight=hyperedge_weight)
             item_embedding = raw_item_embedding
 
@@ -663,7 +677,6 @@ class HyCoRecModel(BaseModel):
             
             hyperedge_weight = None
             if entity_weight_fn is not None:
-                edge_weight, weight_logits = entity_weight_fn(sub_entity_embedding, sub_entity_edge_index)
                 hyperedge_weight ,entity_weight = entity_weight_fn(sub_entity_embedding, sub_entity_edge_index)
             
             raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index, hyperedge_weight=hyperedge_weight)
@@ -679,7 +692,6 @@ class HyCoRecModel(BaseModel):
             
             hyperedge_weight = None
             if word_weight_fn is not None:
-                edge_weight, weight_logits = word_weight_fn(sub_word_embedding, sub_word_edge_index)
                 hyperedge_weight ,word_weight = word_weight_fn(sub_word_embedding, sub_word_edge_index)
             
             raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index, hyperedge_weight=hyperedge_weight)
@@ -692,6 +704,11 @@ class HyCoRecModel(BaseModel):
             context_embedding = tot_entity_embedding[related_entities]
             user_repr = self._attention_and_gating(item_embedding, entity_embedding, word_embedding, context_embedding)
         
+        # print("##################################################")
+        # print(item_weight.shape if item_weight is not None else None,
+        #       entity_weight.shape if entity_weight is not None else None,
+        #       word_weight.shape if word_weight is not None else None)
+        # print("*****************************************************")
         return user_repr, item_weight, entity_weight, word_weight
 
     def _starts(self, batch_size):
