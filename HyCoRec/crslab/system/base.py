@@ -121,6 +121,13 @@ class BaseSystem(ABC):
             self.use_wandb = False
             return
 
+        if isinstance(self.opt, dict):
+            wandb_config = dict(self.opt)
+        elif hasattr(self.opt, 'opt') and isinstance(self.opt.opt, dict):
+            wandb_config = dict(self.opt.opt)
+        else:
+            wandb_config = {}
+
         init_kwargs = {
             'project': wandb_opt.get('project', 'HyCoRec'),
             'name': wandb_opt.get('name'),
@@ -128,7 +135,7 @@ class BaseSystem(ABC):
             'group': wandb_opt.get('group'),
             'tags': wandb_opt.get('tags'),
             'job_type': 'debug' if debug else 'train',
-            'config': dict(self.opt),
+            'config': wandb_config,
         }
         mode = wandb_opt.get('mode')
         if mode:
