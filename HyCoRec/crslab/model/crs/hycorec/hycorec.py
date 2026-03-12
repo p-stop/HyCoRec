@@ -1,4 +1,4 @@
-# -*- encoding: utf-8 -*-
+﻿# -*- encoding: utf-8 -*-
 # @Time    :   2021/5/26
 # @Author  :   Chenzhan Shang
 # @email   :   czshang@outlook.com
@@ -528,55 +528,8 @@ class HyCoRecModel(BaseModel):
         loss = self.rec_loss(scores, item)
         return loss, scores
 
-    def recommend_with_weight(self, batch, mode, batch_item_weights=None, batch_entity_weights=None, batch_word_weights=None):
-        """
-        带权重的推荐模块，仿照 CACHE/models.py 的 edge_weight 向前传播机制。
-        
-        外部传入 0~1 的超边权重，模型根据这些权重进行有权重的超图卷积，
-        最终输出带权重影响的推荐 logits。
-        
-        Args:
-            batch: 输入批次数据
-            mode: 'train' / 'valid' / 'test'
-            batch_item_weights: list of Tensor，每个样本的 item 超边权重 (num_hyperedges,)
-            batch_entity_weights: list of Tensor，每个样本的 entity 超边权重
-            batch_word_weights: list of Tensor，每个样本的 word 超边权重
-        
-        Returns:
-            loss: 推荐损失
-            scores: (batch_size, n_entity) 各实体得分
-        """
-        # 获取数据
-        conv_id = batch['conv_id']
-        related_item = batch['related_item']
-        related_entity = batch['related_entity']
-        related_word = batch['related_word']
-        item = batch['item']
-        
-        # RGCN 编码
-        item_embedding = self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        entity_embedding = self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        token_embedding = self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
 
-        # 带权重的用户编码
-        user_embedding = self.encode_user(
-            related_item,
-            related_entity,
-            related_word,
-            item_embedding,
-            entity_embedding,
-            token_embedding,
-            batch_item_weights=batch_item_weights,
-            batch_entity_weights=batch_entity_weights,
-            batch_word_weights=batch_word_weights
-        )  # (batch_size, emb_dim)
-
-        # 计算各实体得分
-        scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)  # (batch_size, n_entity)
-        loss = self.rec_loss(scores, item)
-        return loss, scores
-
-    def recommend_with_weight_fn(self, batch, mode, item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
+    def recommend_with_weight(self, batch, mode, item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
         """
         带权重生成函数的推荐模块，仿照 CACHE/train.py 的训练机制。
         
@@ -608,7 +561,7 @@ class HyCoRecModel(BaseModel):
         token_embedding = self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
 
         # 带权重函数的用户编码
-        user_embedding, weight_info = self.encode_user_with_weight_fn(
+        user_embedding, weight_info = self.encode_user_with_weight(
             related_item,
             related_entity,
             related_word,
@@ -625,7 +578,7 @@ class HyCoRecModel(BaseModel):
         loss = self.rec_loss(scores, item)
         return loss, scores, weight_info
 
-    def encode_user_with_weight_fn(self, batch_related_items, batch_related_entities, batch_related_words,
+    def encode_user_with_weight(self, batch_related_items, batch_related_entities, batch_related_words,
                                     tot_item_embedding, tot_entity_embedding, tot_word_embedding,
                                     item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
         """
@@ -641,12 +594,12 @@ class HyCoRecModel(BaseModel):
             weight_info: list of dict，每个样本的权重信息
         """
         user_repr_list = []
-        weight_info_list = []
+        weight_info_list = {'item': [], 'entity': [], 'word': []}
         
         for related_items, related_entities, related_words in zip(
             batch_related_items, batch_related_entities, batch_related_words
         ):
-            user_repr, weight_info = self.encode_user_repr_with_weight_fn(
+            user_repr, item_weight,entity_weight,word_weight = self.encode_user_repr_with_weight(
                 related_items, related_entities, related_words,
                 tot_item_embedding, tot_entity_embedding, tot_word_embedding,
                 item_weight_fn=item_weight_fn,
@@ -654,12 +607,15 @@ class HyCoRecModel(BaseModel):
                 word_weight_fn=word_weight_fn
             )
             user_repr_list.append(user_repr)
-            weight_info_list.append(weight_info)
+            weight_info_list['item'].append(item_weight)
+            weight_info_list['entity'].append(entity_weight)
+            weight_info_list['word'].append(word_weight)
         
         user_embedding = torch.stack(user_repr_list, dim=0)
-        return user_embedding, weight_info_list
+        weight_info = {k: torch.stack(v, dim=0) for k, v in weight_info_list.items()}
+        return user_embedding, weight_info
 
-    def encode_user_repr_with_weight_fn(self, related_items, related_entities, related_words,
+    def encode_user_repr_with_weight(self, related_items, related_entities, related_words,
                                          tot_item_embedding, tot_entity_embedding, tot_word_embedding,
                                          item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
         """
@@ -678,7 +634,6 @@ class HyCoRecModel(BaseModel):
             user_repr: 用户表示向量
             weight_info: dict，包含 item/entity/word 的权重信息
         """
-        weight_info = {'item': None, 'entity': None, 'word': None}
         
         # Item 超图
         item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
@@ -693,8 +648,7 @@ class HyCoRecModel(BaseModel):
                 # 调用权重生成函数
                 edge_weight, weight_logits = item_weight_fn(sub_item_embedding, sub_item_edge_index)
                 # 将边权重聚合为超边权重（mean pooling）
-                hyperedge_weight = self._edge_weight_to_hyperedge_weight(edge_weight, sub_item_edge_index)
-                weight_info['item'] = {'weight': edge_weight, 'logits': weight_logits}
+                hyperedge_weight ,item_weight = item_weight_fn(sub_item_embedding, sub_item_edge_index)
             
             raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index, hyperedge_weight=hyperedge_weight)
             item_embedding = raw_item_embedding
@@ -710,8 +664,7 @@ class HyCoRecModel(BaseModel):
             hyperedge_weight = None
             if entity_weight_fn is not None:
                 edge_weight, weight_logits = entity_weight_fn(sub_entity_embedding, sub_entity_edge_index)
-                hyperedge_weight = self._edge_weight_to_hyperedge_weight(edge_weight, sub_entity_edge_index)
-                weight_info['entity'] = {'weight': edge_weight, 'logits': weight_logits}
+                hyperedge_weight ,entity_weight = entity_weight_fn(sub_entity_embedding, sub_entity_edge_index)
             
             raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index, hyperedge_weight=hyperedge_weight)
             entity_embedding = raw_entity_embedding
@@ -727,8 +680,7 @@ class HyCoRecModel(BaseModel):
             hyperedge_weight = None
             if word_weight_fn is not None:
                 edge_weight, weight_logits = word_weight_fn(sub_word_embedding, sub_word_edge_index)
-                hyperedge_weight = self._edge_weight_to_hyperedge_weight(edge_weight, sub_word_edge_index)
-                weight_info['word'] = {'weight': edge_weight, 'logits': weight_logits}
+                hyperedge_weight ,word_weight = word_weight_fn(sub_word_embedding, sub_word_edge_index)
             
             raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index, hyperedge_weight=hyperedge_weight)
             word_embedding = raw_word_embedding
@@ -740,48 +692,7 @@ class HyCoRecModel(BaseModel):
             context_embedding = tot_entity_embedding[related_entities]
             user_repr = self._attention_and_gating(item_embedding, entity_embedding, word_embedding, context_embedding)
         
-        return user_repr, weight_info
-
-    def _edge_weight_to_hyperedge_weight(self, edge_weight, hyper_edge_index, aggregation='mean'):
-        """
-        将边权重聚合为超边权重。
-        
-        仿照 CACHE/models.py 中的 edge_weight 机制：
-        - edge_weight: (num_connections,) 每条 node-hyperedge 连接的权重
-        - 聚合为 hyperedge_weight: (num_hyperedges,) 每条超边的权重
-        
-        Args:
-            edge_weight: (num_connections,) 边权重
-            hyper_edge_index: (2, num_connections) [节点ID, 超边ID]
-            aggregation: 聚合方式 'mean', 'sum', 'max'
-        
-        Returns:
-            hyperedge_weight: (num_hyperedges,) 超边权重
-        """
-        if edge_weight is None:
-            return None
-            
-        # 确保 edge_weight 是 1D
-        if edge_weight.dim() > 1:
-            edge_weight = edge_weight.squeeze(-1)
-        
-        hedge_ids = hyper_edge_index[1]
-        num_hedges = hedge_ids.max().item() + 1
-        
-        if aggregation == 'mean':
-            hyperedge_weight = torch.zeros(num_hedges, device=edge_weight.device)
-            hedge_count = torch.zeros(num_hedges, device=edge_weight.device)
-            hyperedge_weight.scatter_add_(0, hedge_ids, edge_weight)
-            hedge_count.scatter_add_(0, hedge_ids, torch.ones_like(edge_weight))
-            hedge_count = hedge_count.clamp(min=1)
-            hyperedge_weight = hyperedge_weight / hedge_count
-        elif aggregation == 'sum':
-            hyperedge_weight = torch.zeros(num_hedges, device=edge_weight.device)
-            hyperedge_weight.scatter_add_(0, hedge_ids, edge_weight)
-        else:
-            raise ValueError(f"Unknown aggregation: {aggregation}")
-        
-        return hyperedge_weight
+        return user_repr, item_weight, entity_weight, word_weight
 
     def _starts(self, batch_size):
         """Return bsz start tokens."""

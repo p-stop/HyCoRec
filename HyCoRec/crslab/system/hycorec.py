@@ -1,4 +1,4 @@
-# -*- encoding: utf-8 -*-
+﻿# -*- encoding: utf-8 -*-
 # @Time    :   2021/5/26
 # @Author  :   Chenzhan Shang
 # @email   :   czshang@outlook.com
@@ -219,8 +219,8 @@ class HyCoRecSystem(BaseSystem):
             def fn(node_features, hyper_edge_index):
                 weight_logits = view_learner(node_features, hyper_edge_index)
                 # 应用 gumbel-softmax
-                weight = gumbel_softmax(weight_logits, self.temperature)
-                return weight, weight_logits  # 返回权重和 logits（用于正则化）
+                weight_prob = gumbel_softmax(weight_logits, self.temperature)
+                return weight_prob, weight_logits  # 返回权重和 logits（用于正则化）
             return fn
         
         item_weight_fn = make_weight_fn(self.view_learner_item)
@@ -228,7 +228,7 @@ class HyCoRecSystem(BaseSystem):
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
         # 3. 事实预测（带学习到的权重）
-        rec_loss_f, scores_f, weight_info = self.model.recommend_with_weight_fn(
+        rec_loss_f, scores_f, weight_info = self.model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_weight_fn,
             entity_weight_fn=entity_weight_fn,
@@ -240,16 +240,16 @@ class HyCoRecSystem(BaseSystem):
             """创建反事实权重生成函数"""
             def fn(node_features, hyper_edge_index):
                 weight_logits = view_learner(node_features, hyper_edge_index)
-                weight = gumbel_softmax(weight_logits, self.temperature)
-                cf_weight = 1 - weight  # 反事实权重
-                return cf_weight, weight_logits
+                weight_prob = gumbel_softmax(weight_logits, self.temperature)
+                cf_weight_prob = 1 - weight_prob  # 反事实权重
+                return cf_weight_prob, weight_logits
             return fn
         
         item_cf_fn = make_cf_weight_fn(self.view_learner_item)
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
         
-        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight_fn(
+        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
             entity_weight_fn=entity_cf_fn,
@@ -261,17 +261,11 @@ class HyCoRecSystem(BaseSystem):
         loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
         
         # 6. 计算边权重正则化（鼓励保留更多边）
+        item_weight = weight_info['item']
+        entity_weight = weight_info['entity']
+        word_weight = weight_info['word']
         aug_weight_mean = 0.0
-        count = 0
-        for info in weight_info:
-            for key in ['item', 'entity', 'word']:
-                if info.get(key) is not None and info[key].get('logits') is not None:
-                    aug_weight = torch.sigmoid(info[key]['logits'])
-                    aug_weight_mean += torch.mean(aug_weight)
-                    count += 1
-        if count > 0:
-            aug_weight_mean = aug_weight_mean / count
-        
+        aug_weight_mean = (item_weight.mean() + entity_weight.mean() + word_weight.mean())        
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
         view_loss = (self.view_alpha * loss_f + 
                      (1 - self.view_alpha) * loss_cf + 
@@ -290,6 +284,9 @@ class HyCoRecSystem(BaseSystem):
         
         # 记录指标
         self.evaluator.optim_metrics.add("view_loss", AverageMetric(view_loss.item()))
+        self.evaluator.optim_metrics.add("loss_f", AverageMetric(loss_f.item()))
+        self.evaluator.optim_metrics.add("loss_cf", AverageMetric(loss_cf.item()))
+        self.evaluator.optim_metrics.add("aug_weight_mean", AverageMetric(aug_weight_mean.item()))
 
     def train_main_model_step(self, batch):
         """
@@ -311,18 +308,19 @@ class HyCoRecSystem(BaseSystem):
         
         # 2. 事实预测（带 ViewLearner 生成的权重）
         def make_weight_fn(view_learner):
+            """创建一个权重生成函数"""
             def fn(node_features, hyper_edge_index):
-                with torch.no_grad():  # ViewLearner 不更新
-                    weight_logits = view_learner(node_features, hyper_edge_index)
-                weight = gumbel_softmax(weight_logits.detach(), self.temperature)
-                return weight, weight_logits.detach()
+                weight_logits = view_learner(node_features, hyper_edge_index)
+                # 应用 gumbel-softmax
+                weight_prob = gumbel_softmax(weight_logits, self.temperature)
+                return weight_prob, weight_logits  # 返回权重和 logits（用于正则化）
             return fn
         
         item_weight_fn = make_weight_fn(self.view_learner_item)
         entity_weight_fn = make_weight_fn(self.view_learner_entity)
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
-        rec_loss_f, scores_f, _ = self.model.recommend_with_weight_fn(
+        rec_loss_f, scores_f, _ = self.model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_weight_fn,
             entity_weight_fn=entity_weight_fn,
@@ -331,19 +329,19 @@ class HyCoRecSystem(BaseSystem):
         
         # 3. 反事实预测
         def make_cf_weight_fn(view_learner):
+            """创建反事实权重生成函数"""
             def fn(node_features, hyper_edge_index):
-                with torch.no_grad():
-                    weight_logits = view_learner(node_features, hyper_edge_index)
-                weight = gumbel_softmax(weight_logits.detach(), self.temperature)
-                cf_weight = 1 - weight
-                return cf_weight, weight_logits.detach()
+                weight_logits = view_learner(node_features, hyper_edge_index)
+                weight_prob = gumbel_softmax(weight_logits, self.temperature)
+                cf_weight_prob = 1 - weight_prob  # 反事实权重
+                return cf_weight_prob, weight_logits
             return fn
         
         item_cf_fn = make_cf_weight_fn(self.view_learner_item)
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
         
-        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight_fn(
+        rec_loss_cf, scores_cf, _ = self.model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
             entity_weight_fn=entity_cf_fn,
@@ -365,6 +363,9 @@ class HyCoRecSystem(BaseSystem):
         # 记录指标
         rec_loss_value = rec_loss_orig.sum().item()
         self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss_value))
+        self.evaluator.optim_metrics.add("model_loss", AverageMetric(model_loss.item()))
+        self.evaluator.optim_metrics.add("main_loss_f", AverageMetric(loss_f.item()))    
+        self.evaluator.optim_metrics.add("main_loss_cf", AverageMetric(loss_cf.item()))
 
     def factual_loss(self, scores_orig, scores_f):
         """
