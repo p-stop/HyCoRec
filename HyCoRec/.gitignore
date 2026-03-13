@@ -8,6 +8,7 @@ visualize_log.py
 data/
 pretrain_models/
 log/
+wandb/
 
 # Python 缓存文件
 __pycache__/

@@ -144,12 +144,16 @@ class BaseSystem(ABC):
 
         try:
             self.wandb_run = wandb.init(**init_kwargs)
+            self.wandb_run = wandb.init(**init_kwargs)
+            self.wandb_run.define_metric("epoch")
+            self.wandb_run.define_metric("*", step_metric="epoch")
             logger.info('[WandB initialized]')
         except Exception as exc:
             logger.warning(f'[WandB disabled] init failed: {exc}')
             self.use_wandb = False
             self.wandb_run = None
 
+    # 2) 统一 log 时显式带 epoch 字段（不要依赖默认 step）
     def log_wandb_metrics(self, metrics, stage=None, mode=None, epoch=None):
         if not self.use_wandb or self.wandb_run is None or not metrics:
             return
@@ -161,10 +165,10 @@ class BaseSystem(ABC):
             payload[metric_key] = value
 
         if epoch is not None and epoch >= 0:
-            epoch_key = f'{prefix}/epoch' if prefix else 'epoch'
-            payload[epoch_key] = epoch
+            payload["epoch"] = epoch
 
         self.wandb_run.log(payload)
+
 
     def finish_wandb(self):
         if not self.use_wandb or self.wandb_run is None:

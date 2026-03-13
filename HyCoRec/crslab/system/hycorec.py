@@ -213,6 +213,7 @@ class HyCoRecSystem(BaseSystem):
         self.model.eval()
         
         # 1. 原始预测（不带权重）
+        print("Getting original predictions...")
         with torch.no_grad():
             rec_loss_orig, scores_orig = self.model.forward(batch, 'train', 'rec')
         
@@ -237,6 +238,7 @@ class HyCoRecSystem(BaseSystem):
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
         # 3. 事实预测（带学习到的权重）
+        print("Getting factual predictions with ViewLearner weights...")
         core_model = self._core_model()
         rec_loss_f, scores_f, weight_info = core_model.recommend_with_weight(
             batch, 'train',
@@ -258,7 +260,7 @@ class HyCoRecSystem(BaseSystem):
         item_cf_fn = make_cf_weight_fn(self.view_learner_item)
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
-        
+        print("Getting counterfactual predictions with inverted ViewLearner weights...")
         rec_loss_cf, scores_cf, _ = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
@@ -277,6 +279,7 @@ class HyCoRecSystem(BaseSystem):
         aug_weight_mean = 0.0
         aug_weight_mean = (item_weight.mean() + entity_weight.mean() + word_weight.mean())        
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
+        print(f"loss_f: {loss_f}, loss_cf: {loss_cf}, aug_weight_mean: {aug_weight_mean}")
         view_loss = (self.view_alpha * loss_f + 
                      (1 - self.view_alpha) * loss_cf + 
                      self.view_lambda * aug_weight_mean)
