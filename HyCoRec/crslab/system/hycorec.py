@@ -180,11 +180,13 @@ class HyCoRecSystem(BaseSystem):
         for epoch in range(self.rec_epoch):
             self.evaluator.reset_metrics()
             logger.info(f'[Recommendation epoch {str(epoch)}]')
+            self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
             # 每 50 个 epoch 衰减 view_lambda
             if (epoch + 1) % 50 == 0:
                 self.view_lambda *= 0.5
                 logger.info(f'[Decay view_lambda to {self.view_lambda}]')
+                self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
             logger.info('[Train]')
             for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
@@ -203,7 +205,8 @@ class HyCoRecSystem(BaseSystem):
                     # 不使用反事实推理，使用原始训练
                     self.step(batch, stage='rec', mode='train')
             
-            self.evaluator.report(epoch=epoch, mode='train')
+            train_report = self.evaluator.report(epoch=epoch, mode='train')
+            self.log_wandb_metrics(train_report, stage='rec', mode='train', epoch=epoch)
             
             # val
             logger.info('[Valid]')
@@ -211,7 +214,8 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                     self.step(batch, stage='rec', mode='valid')
-                self.evaluator.report(epoch=epoch, mode='valid')
+                valid_report = self.evaluator.report(epoch=epoch, mode='valid')
+                self.log_wandb_metrics(valid_report, stage='rec', mode='valid', epoch=epoch)
                 # early stop
                 metric = self.evaluator.optim_metrics['rec_loss']
                 if self.early_stop(metric):
@@ -223,7 +227,8 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                 self.step(batch, stage='rec', mode='test')
-            self.evaluator.report(mode='test')
+            test_report = self.evaluator.report(mode='test')
+            self.log_wandb_metrics(test_report, stage='rec', mode='test')
 
     def train_view_learner_step(self, batch):
         """
@@ -241,6 +246,7 @@ class HyCoRecSystem(BaseSystem):
         self.model.eval()
         
         # 1. 原始预测（不带权重）
+        print("Getting original predictions...")
         with torch.no_grad():
             rec_loss_orig, scores_orig = self.model.forward(batch, 'train', 'rec')
         
@@ -265,6 +271,7 @@ class HyCoRecSystem(BaseSystem):
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
         # 3. 事实预测（带学习到的权重）
+        print("Getting factual predictions with ViewLearner weights...")
         core_model = self._core_model()
         rec_loss_f, scores_f, weight_info = core_model.recommend_with_weight(
             batch, 'train',
@@ -286,7 +293,7 @@ class HyCoRecSystem(BaseSystem):
         item_cf_fn = make_cf_weight_fn(self.view_learner_item)
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
-        
+        print("Getting counterfactual predictions with inverted ViewLearner weights...")
         rec_loss_cf, scores_cf, _ = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
@@ -305,6 +312,7 @@ class HyCoRecSystem(BaseSystem):
         aug_weight_mean = 0.0
         aug_weight_mean = (item_weight.mean() + entity_weight.mean() + word_weight.mean())        
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
+        print(f"loss_f: {loss_f}, loss_cf: {loss_cf}, aug_weight_mean: {aug_weight_mean}")
         view_loss = (self.view_alpha * loss_f + 
                      (1 - self.view_alpha) * loss_cf + 
                      self.view_lambda * aug_weight_mean)
@@ -450,14 +458,16 @@ class HyCoRecSystem(BaseSystem):
             logger.info('[Train]')
             for batch in self.train_dataloader.get_conv_data(batch_size=self.conv_batch_size):
                 self.step(batch, stage='conv', mode='train')
-            self.evaluator.report(epoch=epoch, mode='train')
+            train_report = self.evaluator.report(epoch=epoch, mode='train')
+            self.log_wandb_metrics(train_report, stage='conv', mode='train', epoch=epoch)
             # val
             logger.info('[Valid]')
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
                     self.step(batch, stage='conv', mode='valid')
-                self.evaluator.report(epoch=epoch, mode='valid')
+                valid_report = self.evaluator.report(epoch=epoch, mode='valid')
+                self.log_wandb_metrics(valid_report, stage='conv', mode='valid', epoch=epoch)
                 # early stop
                 metric = self.evaluator.optim_metrics['gen_loss']
                 if self.early_stop(metric):
@@ -468,7 +478,8 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
                 self.step(batch, stage='conv', mode='test')
-            self.evaluator.report(mode='test')
+            test_report = self.evaluator.report(mode='test')
+            self.log_wandb_metrics(test_report, stage='conv', mode='test')
 
     def fit(self):
         self.train_recommender()

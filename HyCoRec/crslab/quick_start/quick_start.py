@@ -72,11 +72,15 @@ def run_crslab(config, save_data=False, restore_data=False, save_system=False, r
     # system
     CRS = get_system(config, train_dataloader, valid_dataloader, test_dataloader, vocab, side_data, restore_system,
                      interact, debug)
-    if interact:
-        CRS.interact()
-    else:
-        CRS.fit()
-        if save_system:
-            CRS.save_model()
+    try:
+        if interact:
+            CRS.interact()
+        else:
+            CRS.fit()
+            if save_system:
+                CRS.save_model()
+    finally:
+        if hasattr(CRS, 'finish_wandb'):
+            CRS.finish_wandb()
 
     return

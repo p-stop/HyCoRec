@@ -36,8 +36,25 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--seed', type=int, default=2020)
     parser.add_argument('-p', '--pretrain', action='store_true', help='use pretrain weights')
     parser.add_argument('-e', '--pretrain_epoch', type=int, default=9999, help='pretrain epoch')
+    parser.add_argument('--disable_wandb', action='store_true', help='disable wandb logging')
+    parser.add_argument('--wandb_project', type=str, default='HyCoRec', help='wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity/team')
+    parser.add_argument('--wandb_name', type=str, default=None, help='wandb run name')
+    parser.add_argument('--wandb_group', type=str, default=None, help='wandb run group')
+    parser.add_argument('--wandb_mode', type=str, default=None, help='wandb mode (online/offline/disabled)')
+    parser.add_argument('--wandb_tags', nargs='*', default=None, help='wandb tags separated by spaces')
     args, _ = parser.parse_known_args()
     config = Config(args.config, args.gpu, args.debug, args.seed, args.pretrain, args.pretrain_epoch)
+    config['use_wandb'] = not args.disable_wandb
+    config['wandb'] = {
+        'enable': not args.disable_wandb,
+        'project': args.wandb_project,
+        'entity': args.wandb_entity,
+        'name': args.wandb_name,
+        'group': args.wandb_group,
+        'mode': args.wandb_mode,
+        'tags': args.wandb_tags,
+    }
 
     from crslab.quick_start import run_crslab
 

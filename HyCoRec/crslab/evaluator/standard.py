@@ -66,14 +66,16 @@ class StandardEvaluator(BaseEvaluator):
             self.gen_metrics.add(k, AverageMetric(len(v) / self.dist_cnt))
         reports = [self.rec_metrics.report(), self.gen_metrics.report(), self.optim_metrics.report()]
         all_reports = aggregate_unnamed_reports(reports)
+        report_dict = {k: all_reports[k].value() for k in all_reports}
         self.result_data.append({
             'epoch': epoch,
             'mode': mode,
-            'report': {k:all_reports[k].value() for k in all_reports}
+            'report': report_dict
         })
         if self.file_path:
             json.dump(self.result_data, open(self.file_path, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
         logger.info('\n' + nice_report(all_reports))
+        return report_dict
 
     def reset_metrics(self):
         # rec

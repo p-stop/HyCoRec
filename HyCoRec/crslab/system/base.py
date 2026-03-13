@@ -20,6 +20,10 @@ import torch
 from loguru import logger
 from torch import optim
 from transformers import Adafactor
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from crslab.config import SAVE_PATH
 from crslab.evaluator import get_evaluator
@@ -101,6 +105,76 @@ class BaseSystem(ABC):
 
         if not interact:
             self.evaluator = get_evaluator('standard', opt['dataset'], opt['rankfile'])
+        self.wandb_run = None
+        self.use_wandb = False
+        self._init_wandb(interact=interact, debug=debug)
+
+    def _init_wandb(self, interact=False, debug=False):
+        wandb_opt = self.opt.get('wandb', {})
+        self.use_wandb = bool(self.opt.get('use_wandb', wandb_opt.get('enable', False)))
+        if interact:
+            self.use_wandb = False
+        if not self.use_wandb:
+            return
+        if wandb is None:
+            logger.warning('[WandB disabled] package `wandb` is not installed.')
+            self.use_wandb = False
+            return
+
+        if isinstance(self.opt, dict):
+            wandb_config = dict(self.opt)
+        elif hasattr(self.opt, 'opt') and isinstance(self.opt.opt, dict):
+            wandb_config = dict(self.opt.opt)
+        else:
+            wandb_config = {}
+
+        init_kwargs = {
+            'project': wandb_opt.get('project', 'HyCoRec'),
+            'name': wandb_opt.get('name'),
+            'entity': wandb_opt.get('entity'),
+            'group': wandb_opt.get('group'),
+            'tags': wandb_opt.get('tags'),
+            'job_type': 'debug' if debug else 'train',
+            'config': wandb_config,
+        }
+        mode = wandb_opt.get('mode')
+        if mode:
+            init_kwargs['mode'] = mode
+        init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
+
+        try:
+            self.wandb_run = wandb.init(**init_kwargs)
+            self.wandb_run = wandb.init(**init_kwargs)
+            self.wandb_run.define_metric("epoch")
+            self.wandb_run.define_metric("*", step_metric="epoch")
+            logger.info('[WandB initialized]')
+        except Exception as exc:
+            logger.warning(f'[WandB disabled] init failed: {exc}')
+            self.use_wandb = False
+            self.wandb_run = None
+
+    # 2) 统一 log 时显式带 epoch 字段（不要依赖默认 step）
+    def log_wandb_metrics(self, metrics, stage=None, mode=None, epoch=None):
+        if not self.use_wandb or self.wandb_run is None or not metrics:
+            return
+
+        prefix = '/'.join([part for part in (stage, mode) if part])
+        payload = {}
+        for key, value in metrics.items():
+            metric_key = f'{prefix}/{key}' if prefix else key
+            payload[metric_key] = value
+
+        if epoch is not None and epoch >= 0:
+            payload["epoch"] = epoch
+
+        self.wandb_run.log(payload)
+
+
+    def finish_wandb(self):
+        if not self.use_wandb or self.wandb_run is None:
+            return
+        self.wandb_run.finish()
+        self.wandb_run = None
 
     def init_optim(self, opt, parameters):
         self.optim_opt = opt
