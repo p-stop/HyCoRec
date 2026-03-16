@@ -70,6 +70,15 @@ class HyCoRecSystem(BaseSystem):
         self.pretrain_model_path = self.rec_optim_opt.get('pretrain_model_path', None)
         self.save_pretrain_model = self.rec_optim_opt.get('save_pretrain_model', True)
         self.pretrain_save_path = self.rec_optim_opt.get('pretrain_save_path', './pretrain_models')
+        self.pretrain_model_name = self.rec_optim_opt.get(
+            'pretrain_model_name',
+            self.opt.get('pretrain_model_name', None)
+        )
+        if not self.pretrain_model_path and self.pretrain_model_name:
+            self.pretrain_model_path = os.path.join(
+                self.pretrain_save_path,
+                self._get_pretrain_model_filename()
+            )
         
         # 构建 ViewLearner（为三种超图各一个）
         # 注意：ViewLearner 需要能直接处理节点特征和超边索引
@@ -470,12 +479,21 @@ class HyCoRecSystem(BaseSystem):
     def interact(self):
         pass
 
+    def _get_pretrain_model_filename(self):
+        """Return the configured pretrain model filename."""
+        if self.pretrain_model_name:
+            if self.pretrain_model_name.endswith('.pth'):
+                return self.pretrain_model_name
+            return f'{self.pretrain_model_name}.pth'
+
+        model_name = self.opt.get('model_name', 'hycorec')
+        dataset_name = self.opt.get('dataset', 'unknown')
+        return f'{model_name}_{dataset_name}_pretrain.pth'
+
     def _save_pretrain_model(self):
         """保存预训练后的主模型"""
         os.makedirs(self.pretrain_save_path, exist_ok=True)
-        model_name = self.opt.get('model_name', 'hycorec')
-        dataset_name = self.opt.get('dataset', 'unknown')
-        save_file = os.path.join(self.pretrain_save_path, f'{model_name}_{dataset_name}_pretrain.pth')
+        save_file = os.path.join(self.pretrain_save_path, self._get_pretrain_model_filename())
         
         if os.environ.get("CUDA_VISIBLE_DEVICES") == '-1':
             state_dict = self.model.state_dict()
