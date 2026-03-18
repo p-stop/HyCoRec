@@ -1,0 +1,66 @@
+# dataset
+dataset: ReDial
+tokenize: nltk
+# dataloader
+related_truncate: 1024
+context_truncate: 256
+response_truncate: 30
+scale: 1
+# model
+model: HyCoRec
+token_emb_dim: 300
+kg_emb_dim: 256
+num_bases: 8
+n_heads: 2
+n_layers: 2
+ffn_size: 300
+dropout: 0.1
+attention_dropout: 0.0
+relu_dropout: 0.1
+learn_positional_embeddings: false
+embeddings_scale: true
+reduction: false
+n_positions: 1024
+user_proj_dim: 512
+# HyCoRec-CHANGE
+mha_n_heads: 4
+pooling: Mean
+extension_strategy: Adaptive
+# optim
+rec:
+  epoch: 40
+  batch_size: 256
+  early_stop: False
+  stop_mode: min
+  impatience: 2
+  optimizer:
+    name: Adam
+    lr: !!float 5e-4
+  # ===== 预训练配置 =====
+  pretrain_epochs: 3                    # 预训练轮数
+  # pretrain_model_path: null              # 预训练模型路径，设置后跳过预训练直接加载
+  pretrain_model_path: "./pretrain_models/256kg_dim 3e.pth"  # 示例：加载已有模型
+  # pretrain_model_name: "256kg_dim 3e"              # custom pretrain filename, e.g. "epoch_2" or "epoch_2.pth"
+  save_pretrain_model: true               # 预训练后是否保存模型
+  pretrain_save_path: "./pretrain_models"  # 预训练模型保存目录
+  # ===== ViewLearner 配置 =====
+  use_counterfactual: true               # 是否使用反事实训练
+  view_lr: !!float 1e-4                  # ViewLearner 学习率
+  view_wd: !!float 1e-4                  # ViewLearner 权重衰减
+  view_alpha: 0.5                        # factual vs counterfactual 权重
+  view_lambda: 0.1                       # 边权重正则化系数
+  model_lambda: 0.1                      # 主模型对比损失权重
+  gamma: 0.5                             # hinge loss margin
+  temperature: 1.0                       # gumbel softmax 温度
+conv:
+  epoch: 20
+  batch_size: 128
+  impatience: 1
+  optimizer:
+    name: Adam
+    lr: !!float 1e-3
+  lr_scheduler:
+    name: ReduceLROnPlateau
+    patience: 3
+    factor: 0.5
+  gradient_clip: 0.1

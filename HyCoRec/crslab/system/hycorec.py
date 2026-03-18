@@ -74,11 +74,6 @@ class HyCoRecSystem(BaseSystem):
             'pretrain_model_name',
             self.opt.get('pretrain_model_name', None)
         )
-        if not self.pretrain_model_path and self.pretrain_model_name:
-            self.pretrain_model_path = os.path.join(
-                self.pretrain_save_path,
-                self._get_pretrain_model_filename()
-            )
         
         # 构建 ViewLearner（为三种超图各一个）
         # 注意：ViewLearner 需要能直接处理节点特征和超边索引
@@ -255,7 +250,6 @@ class HyCoRecSystem(BaseSystem):
         self.model.eval()
         
         # 1. 原始预测（不带权重）
-        print("Getting original predictions...")
         with torch.no_grad():
             rec_loss_orig, scores_orig = self.model.forward(batch, 'train', 'rec')
         
@@ -280,7 +274,6 @@ class HyCoRecSystem(BaseSystem):
         word_weight_fn = make_weight_fn(self.view_learner_word)
         
         # 3. 事实预测（带学习到的权重）
-        print("Getting factual predictions with ViewLearner weights...")
         core_model = self._core_model()
         rec_loss_f, scores_f, weight_info = core_model.recommend_with_weight(
             batch, 'train',
@@ -302,7 +295,6 @@ class HyCoRecSystem(BaseSystem):
         item_cf_fn = make_cf_weight_fn(self.view_learner_item)
         entity_cf_fn = make_cf_weight_fn(self.view_learner_entity)
         word_cf_fn = make_cf_weight_fn(self.view_learner_word)
-        print("Getting counterfactual predictions with inverted ViewLearner weights...")
         rec_loss_cf, scores_cf, _ = core_model.recommend_with_weight(
             batch, 'train',
             item_weight_fn=item_cf_fn,
@@ -311,17 +303,22 @@ class HyCoRecSystem(BaseSystem):
         )
         
         # 5. 计算事实损失和反事实损失
-        loss_f = self.factual_loss(scores_orig, scores_f)
-        loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
+        scores_orig_norm = torch.sigmoid(scores_orig)
+        loss_f = self.factual_loss(scores_orig_norm, scores_f)
+        loss_cf = self.counterfactual_loss(scores_orig_norm, scores_cf)
         
         # 6. 计算边权重正则化（鼓励保留更多边）
         item_weight = weight_info['item']
         entity_weight = weight_info['entity']
         word_weight = weight_info['word']
         aug_weight_mean = 0.0
-        aug_weight_mean = (item_weight.mean() + entity_weight.mean() + word_weight.mean())        
+        item_mean = item_weight.mean().item() if item_weight is not None else 0.0
+        entity_mean = entity_weight.mean().item() if entity_weight is not None else 0.0
+        word_mean = word_weight.mean().item() if word_weight is not None else 0.0
+        aug_weight_mean = (item_mean + entity_mean + word_mean)      
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
-        print(f"loss_f: {loss_f}, loss_cf: {loss_cf}, aug_weight_mean: {aug_weight_mean}")
+        # print(f"item_weight_mean: {item_mean}, entity_weight_mean: {entity_mean}, word_weight_mean: {word_mean}")
+        # print(f"loss_f: {loss_f}, loss_cf: {loss_cf}, aug_weight_mean: {aug_weight_mean}")
         view_loss = (self.view_alpha * loss_f + 
                      (1 - self.view_alpha) * loss_cf + 
                      self.view_lambda * aug_weight_mean)
@@ -341,7 +338,7 @@ class HyCoRecSystem(BaseSystem):
         self.evaluator.optim_metrics.add("view_loss", AverageMetric(view_loss.item()))
         self.evaluator.optim_metrics.add("loss_f", AverageMetric(loss_f.item()))
         self.evaluator.optim_metrics.add("loss_cf", AverageMetric(loss_cf.item()))
-        self.evaluator.optim_metrics.add("aug_weight_mean", AverageMetric(aug_weight_mean.item()))
+        self.evaluator.optim_metrics.add("aug_weight_mean", AverageMetric(aug_weight_mean))
 
     def train_main_model_step(self, batch):
         """
@@ -423,7 +420,7 @@ class HyCoRecSystem(BaseSystem):
         self.evaluator.optim_metrics.add("main_loss_f", AverageMetric(loss_f.item()))    
         self.evaluator.optim_metrics.add("main_loss_cf", AverageMetric(loss_cf.item()))
 
-    def factual_loss(self, scores_orig, scores_f):
+    def factual_loss(self, scores_orig_norm, scores_f):
         """
         事实损失：鼓励事实预测与原始预测一致
         
@@ -431,7 +428,6 @@ class HyCoRecSystem(BaseSystem):
         当原始预测低分时（认为是负样本），事实预测也应该低
         """
         # 使用 scores 的相对排名来确定正负
-        scores_orig_norm = torch.sigmoid(scores_orig)
         coef = scores_orig_norm.detach().clone()
         coef[scores_orig_norm >= 0.5] = 1
         coef[scores_orig_norm < 0.5] = -1
@@ -442,14 +438,13 @@ class HyCoRecSystem(BaseSystem):
         loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_f), min=0))
         return loss
 
-    def counterfactual_loss(self, scores_orig, scores_cf):
+    def counterfactual_loss(self, scores_orig_norm, scores_cf):
         """
         反事实损失：鼓励反事实预测与原始预测相反
         
         当原始预测高分时，反事实预测应该低
         当原始预测低分时，反事实预测应该高
         """
-        scores_orig_norm = torch.sigmoid(scores_orig)
         coef = scores_orig_norm.detach().clone()
         coef[scores_orig_norm >= 0.5] = -1  # 原来高，现在希望低
         coef[scores_orig_norm < 0.5] = 1    # 原来低，现在希望高

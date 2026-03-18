@@ -144,8 +144,6 @@ class BaseSystem(ABC):
 
         try:
             self.wandb_run = wandb.init(**init_kwargs)
-            self.wandb_run = wandb.init(**init_kwargs)
-            self.wandb_run.define_metric("epoch")
             self.wandb_run.define_metric("*", step_metric="epoch")
             logger.info('[WandB initialized]')
         except Exception as exc:

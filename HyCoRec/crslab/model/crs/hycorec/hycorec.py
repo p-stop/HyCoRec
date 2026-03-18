@@ -623,9 +623,9 @@ class HyCoRecModel(BaseModel):
                 weight_info[k] = torch.zeros(1, device=self.device)
             else:
                 weight_info[k] = torch.cat(tensors, dim=0)
-        print("***************Weight Info (Final)***************")
-        print({k: v.shape if v is not None else None for k, v in weight_info.items()})
-        print("*****************************************************")
+        # print("***************Weight Info (Final)***************")
+        # print({k: v.shape if v is not None else None for k, v in weight_info.items()})
+        # print("*****************************************************")
         return user_embedding, weight_info
 
     def encode_user_repr_with_weight(self, related_items, related_entities, related_words,
