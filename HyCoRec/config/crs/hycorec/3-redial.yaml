@@ -9,7 +9,7 @@ scale: 1
 # model
 model: HyCoRec
 token_emb_dim: 300
-kg_emb_dim: 256
+kg_emb_dim: 128
 num_bases: 8
 n_heads: 2
 n_layers: 2
@@ -28,14 +28,14 @@ pooling: Mean
 extension_strategy: Adaptive
 # optim
 rec:
-  epoch: 20
+  epoch: 40
   batch_size: 256
   early_stop: False
   stop_mode: min
   impatience: 2
   optimizer:
     name: Adam
-    lr: !!float 5e-4
+    lr: !!float 1e-3
   # ===== 预训练配置 =====
   pretrain_epochs: 0                    # 预训练轮数
   pretrain_model_path: null              # 预训练模型路径，设置后跳过预训练直接加载
@@ -44,9 +44,9 @@ rec:
   save_pretrain_model: false           # 预训练后是否保存模型
   pretrain_save_path: "./pretrain_models"  # 预训练模型保存目录
   # ===== ViewLearner 配置 =====
-  use_counterfactual: fasle               # 是否使用反事实训练
+  use_counterfactual: true               # 是否使用反事实训练
   view_lr: !!float 1e-4                  # ViewLearner 学习率
-  view_wd: !!float 1e-4                  # ViewLearner 权重衰减
+  view_wd: !!float 1e-5                  # ViewLearner 权重衰减
   view_alpha: 0.5                        # factual vs counterfactual 权重
   view_lambda: 5.0                       # 边权重正则化系数
   model_lambda: 0.1                      # 主模型对比损失权重
