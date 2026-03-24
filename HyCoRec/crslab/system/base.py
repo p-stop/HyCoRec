@@ -129,7 +129,7 @@ class BaseSystem(ABC):
             wandb_config = {}
 
         init_kwargs = {
-            'project': wandb_opt.get('project', 'HyCoRec'),
+            'project': wandb_opt.get('project', 'HyCoRec_yuan'),
             'name': wandb_opt.get('name'),
             'entity': wandb_opt.get('entity'),
             'group': wandb_opt.get('group'),

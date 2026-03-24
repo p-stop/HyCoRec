@@ -47,6 +47,7 @@ class HyCoRecSystem(BaseSystem):
 
         self.rec_optim_opt = opt['rec']
         self.conv_optim_opt = opt['conv']
+        self.view_optim_opt = opt['view']
         self.rec_epoch = self.rec_optim_opt['epoch']
         self.conv_epoch = self.conv_optim_opt['epoch']
         self.rec_batch_size = self.rec_optim_opt['batch_size']
@@ -55,31 +56,29 @@ class HyCoRecSystem(BaseSystem):
         # ViewLearner 超参数（从配置中读取，设置默认值）
         # 仿照 CACHE/train.py 的参数设置
         self.kg_emb_dim = opt.get('kg_emb_dim', 128)
-        self.view_lr = self.rec_optim_opt.get('view_lr', 0.01)       # CACHE 默认 1e-2
-        self.view_wd = self.rec_optim_opt.get('view_wd', 0.001)      # CACHE 默认 1e-3
-        self.view_alpha = self.rec_optim_opt.get('view_alpha', 0.5)  # factual vs counterfactual 权重
-        self.view_lambda = self.rec_optim_opt.get('view_lambda', 5.0)  # 边权重正则化系数
-        self.model_lambda = self.rec_optim_opt.get('model_lambda', 0.1)  # 主模型损失中的对比损失权重
-        self.gamma = self.rec_optim_opt.get('gamma', 0.5)            # hinge loss margin
-        self.temperature = self.rec_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
-        self.use_counterfactual = self.rec_optim_opt.get('use_counterfactual', True)
+        self.view_hidden_dim = self.view_optim_opt.get('view_hidden_dim', 64)  # ViewLearner 隐藏层维度
+        self.view_lr = self.view_optim_opt.get('view_lr', 0.01)       # CACHE 默认 1e-2
+        self.view_wd = self.view_optim_opt.get('view_wd', 0.001)      # CACHE 默认 1e-3
+        self.view_alpha = self.view_optim_opt.get('view_alpha', 0.5)  # factual vs counterfactual 权重
+        self.view_lambda = self.view_optim_opt.get('view_lambda', 5.0)  # 边权重正则化系数
+        self.model_lambda = self.view_optim_opt.get('model_lambda', 0.1)  # 主模型损失中的对比损失权重
+        self.gamma = self.view_optim_opt.get('gamma', 0.5)            # hinge loss margin
+        self.temperature = self.view_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
+        self.use_counterfactual = self.view_optim_opt.get('use_counterfactual', True)
         
         # 预训练模型加载配置
         # pretrain_model_path: 预训练模型路径，如果指定则跳过预训练直接加载
         # save_pretrain_model: 是否在预训练后保存模型
-        self.pretrain_model_path = self.rec_optim_opt.get('pretrain_model_path', None)
-        self.save_pretrain_model = self.rec_optim_opt.get('save_pretrain_model', True)
-        self.pretrain_save_path = self.rec_optim_opt.get('pretrain_save_path', './pretrain_models')
-        self.pretrain_model_name = self.rec_optim_opt.get(
-            'pretrain_model_name',
-            self.opt.get('pretrain_model_name', None)
-        )
+        self.pretrain_model_path = self.view_optim_opt.get('pretrain_model_path', None)
+        self.save_pretrain_model = self.view_optim_opt.get('save_pretrain_model', True)
+        self.pretrain_save_path = self.view_optim_opt.get('pretrain_save_path', './pretrain_models')
+        self.pretrain_model_name = self.view_optim_opt.get('pretrain_model_name',None)
         
         # 构建 ViewLearner（为三种超图各一个）
         # 注意：ViewLearner 需要能直接处理节点特征和超边索引
-        self.view_learner_item = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
-        self.view_learner_entity = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
-        self.view_learner_word = ViewLearner(self.kg_emb_dim, hidden_dim=64, device=self.device).to(self.device)
+        self.view_learner_item = ViewLearner(self.kg_emb_dim, self.view_hidden_dim, self.device).to(self.device)
+        self.view_learner_entity = ViewLearner(self.kg_emb_dim, self.view_hidden_dim, self.device).to(self.device)
+        self.view_learner_word = ViewLearner(self.kg_emb_dim, self.view_hidden_dim, self.device).to(self.device)
 
     def _core_model(self):
         """Return the underlying model for both plain and DataParallel wrappers."""
@@ -163,7 +162,7 @@ class HyCoRecSystem(BaseSystem):
             self._load_pretrain_model(self.pretrain_model_path)
         else:
             # 执行预训练
-            pretrain_epochs = self.rec_optim_opt.get('pretrain_epochs', 10)
+            pretrain_epochs = self.view_optim_opt.get('pretrain_epochs', 0)
             logger.info(f'[Pretraining main model for {pretrain_epochs} epochs]')
             for epoch in range(pretrain_epochs):
                 self.evaluator.reset_metrics()
@@ -184,13 +183,13 @@ class HyCoRecSystem(BaseSystem):
         for epoch in range(self.rec_epoch):
             self.evaluator.reset_metrics()
             logger.info(f'[Recommendation epoch {str(epoch)}]')
-            self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
+            # self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
-            # 每 50 个 epoch 衰减 view_lambda
-            if (epoch + 1) % 50 == 0:
-                self.view_lambda *= 0.5
-                logger.info(f'[Decay view_lambda to {self.view_lambda}]')
-                self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
+            # # 每 50 个 epoch 衰减 view_lambda
+            # if (epoch + 1) % 50 == 0:
+            #     self.view_lambda *= 0.5
+            #     logger.info(f'[Decay view_lambda to {self.view_lambda}]')
+            #     self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
             logger.info('[Train]')
             for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
