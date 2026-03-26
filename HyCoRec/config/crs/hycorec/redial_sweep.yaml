@@ -1,0 +1,52 @@
+program: run_crslab.py
+method: bayes
+
+metric:
+  name: rec/valid/recall@50
+  goal: maximize
+
+run_cap: 64
+
+parameters:
+  seed:
+    { value : 3407 }
+  kg_emb_dim:
+    values: [128, 256, 384]
+  dropout:
+    values: [0.0, 0.1, 0.2, 0.3]
+  ffn_size:
+    values: [256, 300, 512]
+  rec.batch_size:
+    values: [128, 256, 512]
+  rec.optimizer.lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+  view.view_lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 5e-4
+  view.view_wd:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 1e-3
+  view.view_lambda:
+    distribution: uniform
+    min: 0.01
+    max: 0.5
+  view.model_lambda:
+    distribution: uniform
+    min: 0.01
+    max: 0.5
+  view.temperature:
+    values: [0.3, 0.5, 0.8, 1.0]
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - -c
+  - config/crs/hycorec/redial.yaml
+  - --wandb_project
+  - HyCoRec
+  - ${args_no_boolean_flags}

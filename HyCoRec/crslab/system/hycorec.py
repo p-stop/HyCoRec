@@ -220,7 +220,9 @@ class HyCoRecSystem(BaseSystem):
                 valid_report = self.evaluator.report(epoch=epoch, mode='valid')
                 self.log_wandb_metrics(valid_report, stage='rec', mode='valid', epoch=epoch)
                 # early stop
-                metric = self.evaluator.optim_metrics['rec_loss']
+                metric = valid_report.get(
+                    self.rec_early_stop_metric,
+                )
                 if self.early_stop(metric):
                     break
         

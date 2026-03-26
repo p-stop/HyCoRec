@@ -30,19 +30,20 @@ extension_strategy: Adaptive
 rec:
   epoch: 30
   batch_size: 256
-  early_stop: False
-  stop_mode: min
-  impatience: 2
+  early_stop: True
+  early_stop_metric: recall@50
+  stop_mode: max
+  impatience: 5
   optimizer:
     name: Adam
     lr: !!float 5e-4
 view:
   # ===== 预训练配置 =====
-  pretrain_epochs: 3             ##!!       # 预训练轮数
+  pretrain_epochs: 2             ##!!       # 预训练轮数
   pretrain_model_path: null              # 预训练模型路径，设置后跳过预训练直接加载
   # pretrain_model_path: "./pretrain_models/256kg_dim 2e.pth"  # 示例：加载已有模型
   pretrain_model_name: "256kg_dim,ffn_512,2e"              # custom pretrain filename, e.g. "epoch_2" or "epoch_2.pth"
-  save_pretrain_model: true           # 预训练后是否保存模型
+  save_pretrain_model: false           # 预训练后是否保存模型
   pretrain_save_path: "./pretrain_models"  # 预训练模型保存目录
   # ===== ViewLearner 配置 =====
   use_counterfactual: true        ##!!       # 是否使用反事实训练
@@ -54,7 +55,7 @@ view:
   gamma: 0.5                             # hinge loss margin
   temperature: 1.0                       # gumbel softmax 温度
 conv:
-  epoch: 20
+  epoch: 0
   batch_size: 128
   impatience: 1
   optimizer:
