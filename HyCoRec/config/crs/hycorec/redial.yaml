@@ -28,12 +28,12 @@ pooling: Mean
 extension_strategy: Adaptive
 # optim
 rec:
-  epoch: 30
+  epoch: 50
   batch_size: 256
   early_stop: True
   early_stop_metric: recall@50
   stop_mode: max
-  impatience: 5
+  impatience: 3
   optimizer:
     name: Adam
     lr: !!float 5e-4

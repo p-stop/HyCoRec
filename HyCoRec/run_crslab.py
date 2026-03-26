@@ -74,6 +74,19 @@ def _merge_dict(target, overrides):
             target[key] = value
 
 
+def _build_sweep_agent_run_name(explicit_name=None):
+    if explicit_name:
+        return explicit_name
+
+    sweep_id = os.environ.get('WANDB_SWEEP_ID')
+    agent_gpu = os.environ.get('HYCOREC_SWEEP_AGENT_GPU')
+    if not sweep_id or agent_gpu is None:
+        return explicit_name
+
+    agent_pid = os.getppid()
+    return f'gpu{agent_gpu}_pid{agent_pid}'
+
+
 if __name__ == '__main__':
     # parse args
     parser = argparse.ArgumentParser()
@@ -116,7 +129,7 @@ if __name__ == '__main__':
         'enable': not args.disable_wandb,
         'project': args.wandb_project,
         'entity': args.wandb_entity,
-        'name': args.wandb_name,
+        'name': _build_sweep_agent_run_name(args.wandb_name),
         'group': args.wandb_group,
         'mode': args.wandb_mode,
         'tags': args.wandb_tags,

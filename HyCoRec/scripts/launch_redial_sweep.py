@@ -91,6 +91,7 @@ def main():
 
         env = os.environ.copy()
         env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+        env['HYCOREC_SWEEP_AGENT_GPU'] = str(gpu)
         env['WANDB_DIR'] = str(agent_dir)
         env['TMPDIR'] = str(tmp_dir)
         env['TMP'] = str(tmp_dir)
