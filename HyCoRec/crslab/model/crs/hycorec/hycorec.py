@@ -15,6 +15,7 @@ References:
 """
 
 import json
+import math
 import os.path
 import random
 import pickle
@@ -27,6 +28,7 @@ from loguru import logger
 from torch import nn
 from tqdm import tqdm
 from torch_geometric.nn import RGCNConv, HypergraphConv
+from torch_geometric.utils import softmax
 
 from crslab.config import DATA_PATH, DATASET_PATH
 from crslab.model.base import BaseModel
@@ -35,6 +37,28 @@ from crslab.model.utils.functions import edge_to_pyg_format
 from crslab.model.utils.modules.attention import SelfAttentionBatch, SelfAttentionSeq
 from crslab.model.utils.modules.transformer import TransformerEncoder
 from crslab.model.crs.hycorec.decoder import TransformerDecoderKG
+
+
+def _scatter_mean(values: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
+    """Compute mean aggregation over the first dimension with scatter-add."""
+    # 输出张量的首维对应聚合后的 group 数量，后续维度保持与输入一致。
+    out_shape = (dim_size,) + tuple(values.shape[1:])
+    # 先创建零张量，后面通过 scatter_add 把同组元素累加进去。
+    out = values.new_zeros(out_shape)
+    # 为了适配高维特征，这里把一维 index 扩展到与 values 同形状。
+    expand_shape = (index.size(0),) + (1,) * (values.dim() - 1)
+    # 按照 index 指定的 group 做加和。
+    out.scatter_add_(0, index.view(*expand_shape).expand_as(values), values)
+
+    # 统计每个 group 中有多少元素，后面用于求均值。
+    count = values.new_zeros(dim_size)
+    count.scatter_add_(0, index, values.new_ones(index.size(0)))
+    # 防止某个 group 为空导致除零。
+    count = count.clamp_min(1.0)
+    # 将计数 reshape 成可广播形状。
+    view_shape = (dim_size,) + (1,) * (values.dim() - 1)
+    # 返回按 group 聚合后的均值。
+    return out / count.view(*view_shape)
 
 
 class HyCoRecModel(BaseModel):
@@ -527,189 +551,167 @@ class HyCoRecModel(BaseModel):
         scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)  # (batch_size, n_entity)
         loss = self.rec_loss(scores, item)
         return loss, scores
+    def _encode_kg_embeddings(self):
+        # 对三类节点分别做一次 RGCN 编码，得到整图级节点表示。
+        return {
+            'item': self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type),
+            'entity': self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type),
+            'word': self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
+        }
 
+    def _prepare_single_hypergraph(self, related_nodes, total_embedding, adj):
+        # 当前样本没有该类型节点时，不构图，直接返回 None。
+        if len(related_nodes) == 0:
+            return None
 
-    def recommend_with_weight(self, batch, mode, item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
-        """
-        带权重生成函数的推荐模块，仿照 CACHE/train.py 的训练机制。
-        
-        与 recommend_with_weight 不同的是，这里接受的是权重生成函数，
-        函数会在超图卷积前被调用，根据节点特征和超边索引动态生成权重。
-        
-        Args:
-            batch: 输入批次数据
-            mode: 'train' / 'valid' / 'test'
-            item_weight_fn: 函数 (node_features, hyper_edge_index) -> (weight, weight_logits)
-            entity_weight_fn: 同上
-            word_weight_fn: 同上
-        
-        Returns:
-            loss: 推荐损失
-            scores: (batch_size, n_entity) 各实体得分
-            weight_info: list of dict，每个样本的权重信息（用于正则化）
-        """
-        # 获取数据
-        conv_id = batch['conv_id']
-        related_item = batch['related_item']
-        related_entity = batch['related_entity']
-        related_word = batch['related_word']
-        item = batch['item']
-        
-        # RGCN 编码
-        item_embedding = self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        entity_embedding = self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        token_embedding = self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
+        # 先根据 related_nodes 和邻接表构造当前样本的超图。
+        hypergraph_nodes, hyper_edge_index = self._get_hypergraph(related_nodes, adj)
+        # 再把整图 embedding 裁成当前样本子图所需的节点与边索引。
+        sub_node_embedding, sub_edge_index, _ = self._before_hyperconv(
+            total_embedding, hypergraph_nodes, hyper_edge_index, adj
+        )
 
-        # 带权重函数的用户编码
-        user_embedding, weight_info = self.encode_user_with_weight(
-            related_item,
-            related_entity,
-            related_word,
-            item_embedding,
-            entity_embedding,
-            token_embedding,
-            item_weight_fn=item_weight_fn,
-            entity_weight_fn=entity_weight_fn,
-            word_weight_fn=word_weight_fn
-        )  # (batch_size, emb_dim), list of dict
+        # 预先记录超边数量，避免后面重复从索引里计算。
+        num_hyperedges = 0
+        if sub_edge_index.numel() > 0:
+            num_hyperedges = int(sub_edge_index[1].max().item()) + 1
 
-        # 计算各实体得分
-        scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)  # (batch_size, n_entity)
-        loss = self.rec_loss(scores, item)
-        return loss, scores, weight_info
+        # 返回后续 HGCN 和 ViewLearner 共用的最小子图描述。
+        return {
+            'node_embedding': sub_node_embedding,
+            'hyper_edge_index': sub_edge_index,
+            'num_hyperedges': num_hyperedges
+        }
 
-    def encode_user_with_weight(self, batch_related_items, batch_related_entities, batch_related_words,
-                                    tot_item_embedding, tot_entity_embedding, tot_word_embedding,
-                                    item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
-        """
-        批量获取用户编码，使用权重生成函数动态生成超边权重。
-        
-        Args:
-            item_weight_fn: 函数 (node_features, hyper_edge_index) -> (weight, weight_logits)
-            entity_weight_fn: 同上
-            word_weight_fn: 同上
-        
-        Returns:
-            user_embedding: (batch_size, emb_dim)
-            weight_info: list of dict，每个样本的权重信息
-        """
-        user_repr_list = []
-        weight_info_list = {'item': [], 'entity': [], 'word': []}
-        
-        for related_items, related_entities, related_words in zip(
-            batch_related_items, batch_related_entities, batch_related_words
+    def prepare_recommendation_batch(self, batch, kg_embeddings=None):
+        # 如果外部没有传入编码结果，就在这里统一做一次 RGCN 编码。
+        if kg_embeddings is None:
+            kg_embeddings = self._encode_kg_embeddings()
+
+        # batch_graphs 保存 batch 内每个样本对应的 item/entity/word 子图。
+        batch_graphs = []
+        for related_item, related_entity, related_word in zip(
+            batch['related_item'], batch['related_entity'], batch['related_word']
         ):
-            user_repr, item_weight,entity_weight,word_weight = self.encode_user_repr_with_weight(
-                related_items, related_entities, related_words,
-                tot_item_embedding, tot_entity_embedding, tot_word_embedding,
-                item_weight_fn=item_weight_fn,
-                entity_weight_fn=entity_weight_fn,
-                word_weight_fn=word_weight_fn
+            # related_entity 额外用于构造注意力融合时的上下文表示。
+            context_embedding = None
+            if len(related_entity) > 0:
+                context_embedding = kg_embeddings['entity'][related_entity]
+
+            # 将当前样本三类子图都准备好，供后续反复复用。
+            batch_graphs.append({
+                'item': self._prepare_single_hypergraph(related_item, kg_embeddings['item'], self.item_adj),
+                'entity': self._prepare_single_hypergraph(related_entity, kg_embeddings['entity'], self.entity_adj),
+                'word': self._prepare_single_hypergraph(related_word, kg_embeddings['word'], self.word_adj),
+                'context_embedding': context_embedding
+            })
+
+        # 返回推荐阶段需要的全部中间结果。
+        return {
+            'item': batch['item'],
+            'kg_embeddings': kg_embeddings,
+            'graphs': batch_graphs
+        }
+
+    def _run_hypergraph_conv(self, graph_data, hyper_conv, hyperedge_weight=None):
+        # 缺失图时返回零向量，保持后续拼接逻辑稳定。
+        if graph_data is None:
+            return torch.zeros((1, self.kg_emb_dim), device=self.device)
+        # 否则对当前样本子图执行一次 HGCN，可选传入超边权重。
+        return hyper_conv(
+            graph_data['node_embedding'],
+            graph_data['hyper_edge_index'],
+            hyperedge_weight=hyperedge_weight
+        )
+
+    def encode_user_from_prepared_batch(self, prepared_batch, batch_item_weights=None,
+                                        batch_entity_weights=None, batch_word_weights=None):
+        # 逐样本构造最终用户表示，因为每个样本的子图结构都不同。
+        user_repr_list = []
+
+        for idx, sample_graph in enumerate(prepared_batch['graphs']):
+            # 逐样本取出三类图的超边权重；若无权版本则为 None。
+            item_weight = batch_item_weights[idx] if batch_item_weights is not None else None
+            entity_weight = batch_entity_weights[idx] if batch_entity_weights is not None else None
+            word_weight = batch_word_weights[idx] if batch_word_weights is not None else None
+
+            # item/entity/word 三类子图各自执行带权或不带权的 HGCN。
+            item_embedding = self._run_hypergraph_conv(sample_graph['item'], self.hyper_conv_item, item_weight)
+            entity_embedding = self._run_hypergraph_conv(sample_graph['entity'], self.hyper_conv_entity, entity_weight)
+            word_embedding = self._run_hypergraph_conv(sample_graph['word'], self.hyper_conv_word, word_weight)
+
+            # 将三路子图表示和上下文表示融合成单个用户向量。
+            user_repr = self._attention_and_gating(
+                item_embedding,
+                entity_embedding,
+                word_embedding,
+                sample_graph['context_embedding']
             )
+            # 收集 batch 内所有样本的用户表示。
             user_repr_list.append(user_repr)
-            weight_info_list['item'].append(item_weight)
-            weight_info_list['entity'].append(entity_weight)
-            weight_info_list['word'].append(word_weight)
-            # print("***************Weight Info (After Aggregation)***************")
-            # print({k: v.shape if v is not None else None for k, v in weight_info_list.items()})
-            # print("*****************************************************")
-        user_embedding = torch.stack(user_repr_list, dim=0)
+
+        # 堆叠成标准 batch 形状。
+        return torch.stack(user_repr_list, dim=0)
+
+    def recommend_from_prepared_batch(self, prepared_batch, batch_item_weights=None,
+                                      batch_entity_weights=None, batch_word_weights=None):
+        # 先基于已准备子图得到 batch 用户表示。
+        user_embedding = self.encode_user_from_prepared_batch(
+            prepared_batch,
+            batch_item_weights=batch_item_weights,
+            batch_entity_weights=batch_entity_weights,
+            batch_word_weights=batch_word_weights
+        )
+        # 推荐打分始终与 entity 编码后的整图实体向量做线性匹配。
+        entity_embedding = prepared_batch['kg_embeddings']['entity']
+        scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)
+        # 交叉熵损失仍使用原始 item 标签监督。
+        loss = self.rec_loss(scores, prepared_batch['item'])
+        return loss, scores
+
+    def build_batch_hyperedge_weights(self, prepared_batch, item_weight_fn=None,
+                                      entity_weight_fn=None, word_weight_fn=None):
+        # 保存每个样本、每类图的超边权重。
+        batch_weights = {'item': [], 'entity': [], 'word': []}
+        # 额外保存拍平后的权重，供外部做统一统计。
+        flat_weight_info = {'item': [], 'entity': [], 'word': []}
+
+        # 逐样本生成权重，适配可变大小子图。
+        for sample_graph in prepared_batch['graphs']:
+            # 三类图共用同一套接口，但权重函数各自独立。
+            for graph_key, weight_fn in (
+                ('item', item_weight_fn),
+                ('entity', entity_weight_fn),
+                ('word', word_weight_fn)
+            ):
+                # 取出当前样本当前图类型的子图。
+                graph_data = sample_graph[graph_key]
+                # 无图或未提供权重函数时，表示该分支不启用权重。
+                if graph_data is None or weight_fn is None:
+                    batch_weights[graph_key].append(None)
+                    continue
+
+                # 先生成连接级权重。
+                connection_weight, _ = weight_fn(
+                    graph_data['node_embedding'],
+                    graph_data['hyper_edge_index']
+                )
+                # 保存逐样本超边权重。
+                batch_weights[graph_key].append(connection_weight)
+                # 也保存展平版本供统计使用。
+                flat_weight_info[graph_key].append(connection_weight.reshape(-1))
+
+        # 将拍平后的列表转成张量字典。
         weight_info = {}
-        for k, v_list in weight_info_list.items():
-            # Ignore None and merge all tensors under the same key to one 1-D tensor,
-            # so downstream code can safely call .mean().
-            tensors = [w.reshape(-1) for w in v_list if isinstance(w, torch.Tensor)]
-            if len(tensors) == 0:
-                weight_info[k] = torch.zeros(1, device=self.device)
+        for graph_key, weights in flat_weight_info.items():
+            # 若某一图类型在当前 batch 中不存在，则返回零张量避免空列表问题。
+            if len(weights) == 0:
+                weight_info[graph_key] = torch.zeros(1, device=self.device)
             else:
-                weight_info[k] = torch.cat(tensors, dim=0)
-        # print("***************Weight Info (Final)***************")
-        # print({k: v.shape if v is not None else None for k, v in weight_info.items()})
-        # print("*****************************************************")
-        return user_embedding, weight_info
+                # 否则直接拼接所有样本的权重。
+                weight_info[graph_key] = torch.cat(weights, dim=0)
 
-    def encode_user_repr_with_weight(self, related_items, related_entities, related_words,
-                                         tot_item_embedding, tot_entity_embedding, tot_word_embedding,
-                                         item_weight_fn=None, entity_weight_fn=None, word_weight_fn=None):
-        """
-        编码单个用户表示，使用权重生成函数动态生成超边权重。
-        
-        仿照 CACHE/models.py 和 train.py 的机制：
-        1. 构建超图
-        2. 调用权重生成函数得到边权重
-        3. 将边权重聚合为超边权重
-        4. 使用超边权重进行超图卷积
-        
-        Args:
-            item_weight_fn: 函数 (node_features, hyper_edge_index) -> (weight, weight_logits)
-        
-        Returns:
-            user_repr: 用户表示向量
-            weight_info: dict，包含 item/entity/word 的权重信息
-        """
-        
-        item_weight, entity_weight, word_weight = None, None, None
-        # print("***************Weight Info (Before Aggregation)***************")
-        # Item 超图        
-        item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_items) > 0:
-            items, item_hyper_edge_index = self._get_hypergraph(related_items, self.item_adj)
-            sub_item_embedding, sub_item_edge_index, item_tot2sub = self._before_hyperconv(
-                tot_item_embedding, items, item_hyper_edge_index, self.item_adj
-            )
-            # print(related_items.shape if related_items is not None else None)
-            # print(item_hyper_edge_index if item_hyper_edge_index is not None else None)
-            # print(items if items is not None else None)
-            hyperedge_weight = None
-            if item_weight_fn is not None:
-                # 将边权重聚合为超边权重（mean pooling）
-                hyperedge_weight ,item_weight = item_weight_fn(sub_item_embedding, sub_item_edge_index)
-            raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index, hyperedge_weight=hyperedge_weight)
-            item_embedding = raw_item_embedding
-
-        # Entity 超图
-        entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_entities) > 0:
-            entities, entity_hyper_edge_index = self._get_hypergraph(related_entities, self.entity_adj)
-            sub_entity_embedding, sub_entity_edge_index, entity_tot2sub = self._before_hyperconv(
-                tot_entity_embedding, entities, entity_hyper_edge_index, self.entity_adj
-            )
-            
-            hyperedge_weight = None
-            if entity_weight_fn is not None:
-                hyperedge_weight ,entity_weight = entity_weight_fn(sub_entity_embedding, sub_entity_edge_index)
-            
-            raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index, hyperedge_weight=hyperedge_weight)
-            entity_embedding = raw_entity_embedding
-            
-        # Word 超图
-        word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_words) > 0:
-            words, word_hyper_edge_index = self._get_hypergraph(related_words, self.word_adj)
-            sub_word_embedding, sub_word_edge_index, word_tot2sub = self._before_hyperconv(
-                tot_word_embedding, words, word_hyper_edge_index, self.word_adj
-            )
-            
-            hyperedge_weight = None
-            if word_weight_fn is not None:
-                hyperedge_weight ,word_weight = word_weight_fn(sub_word_embedding, sub_word_edge_index)
-            
-            raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index, hyperedge_weight=hyperedge_weight)
-            word_embedding = raw_word_embedding
-
-        # 注意力机制
-        if len(related_entities) == 0:
-            user_repr = self._attention_and_gating(item_embedding, entity_embedding, word_embedding, None)
-        else:
-            context_embedding = tot_entity_embedding[related_entities]
-            user_repr = self._attention_and_gating(item_embedding, entity_embedding, word_embedding, context_embedding)
-        
-        # print("##################################################")
-        # print(item_weight.shape if item_weight is not None else None,
-        #       entity_weight.shape if entity_weight is not None else None,
-        #       word_weight.shape if word_weight is not None else None)
-        # print("*****************************************************")
-        return user_repr, item_weight, entity_weight, word_weight
+        return batch_weights, weight_info
 
     def _starts(self, batch_size):
         """Return bsz start tokens."""
@@ -931,110 +933,150 @@ class HyCoRecModel(BaseModel):
             return res
 
 
+class HyperedgeAttentionPooling(nn.Module):
+    """CACHE-style PMA-inspired pooling from incident nodes to hyperedges."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super(HyperedgeAttentionPooling, self).__init__()
+        # 保存输入维度，供后面创建参数和输出张量使用。
+        self.input_dim = input_dim
+        # 将节点特征映射到 attention key 空间。
+        self.key_proj = nn.Linear(input_dim, hidden_dim)
+        # 将节点特征映射到 value 空间，最终参与超边表示聚合。
+        self.value_proj = nn.Linear(input_dim, input_dim)
+        # 类似 PMA 中的 seed，作为每个超边共享的初始查询基底。
+        self.seed = nn.Parameter(torch.empty(1, input_dim))
+        # 全局可学习 query，用于衡量节点对超边表示的贡献度。
+        self.query = nn.Parameter(torch.empty(1, hidden_dim))
+        # 两层 LayerNorm 对应 attention 聚合后和 FFN 后的稳定化。
+        self.norm0 = nn.LayerNorm(input_dim)
+        self.norm1 = nn.LayerNorm(input_dim)
+        # 一个轻量 FFN，用于增强聚合后的超边表示。
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.ReLU(),
+            nn.Linear(input_dim, input_dim)
+        )
+        # 显式初始化所有参数。
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # 线性层使用 Xavier 初始化，和项目内其他 MLP 保持一致。
+        nn.init.xavier_uniform_(self.key_proj.weight)
+        nn.init.xavier_uniform_(self.value_proj.weight)
+        nn.init.zeros_(self.key_proj.bias)
+        nn.init.zeros_(self.value_proj.bias)
+        # seed 和 query 也是可学习矩阵，同样采用 Xavier 初始化。
+        nn.init.xavier_uniform_(self.seed)
+        nn.init.xavier_uniform_(self.query)
+        # 归一化层重置为默认状态。
+        self.norm0.reset_parameters()
+        self.norm1.reset_parameters()
+        # FFN 内部线性层单独初始化。
+        for layer in self.ffn:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, node_embedding, hyper_edge_index):
+        # 从 incidence 矩阵中取出“节点索引”和“超边索引”。
+        node_ids = hyper_edge_index[0]
+        hedge_ids = hyper_edge_index[1]
+        # 超边数量默认由索引最大值推断。
+        num_hyperedges = int(hedge_ids.max().item()) + 1
+
+        # 只取实际参与当前超边连接的节点表示。
+        node_repr = node_embedding[node_ids]
+        # 节点先映射到 key 空间，再与全局 query 做点积得到 attention logits。
+        attn_logits = (self.key_proj(node_repr) * self.query).sum(dim=-1)
+        # 标准缩放，避免 logits 过大。
+        attn_logits = attn_logits / math.sqrt(self.query.size(-1))
+        # 在同一条超边内部做 softmax，得到每个连接的注意力分数。
+        attn_scores = softmax(attn_logits, hedge_ids, num_nodes=num_hyperedges)
+
+        # 为每条超边创建输出槽位。
+        hedge_embedding = node_embedding.new_zeros(num_hyperedges, self.input_dim)
+        # 将 value 按注意力加权后累加到对应超边上。
+        hedge_embedding.index_add_(
+            0,
+            hedge_ids,
+            self.value_proj(node_repr) * attn_scores.unsqueeze(-1)
+        )
+
+        # 加上 seed 后做第一层归一化，对齐 PMA 风格的残差结构。
+        hedge_embedding = self.norm0(hedge_embedding + self.seed)
+        # 再经过 FFN 和第二层归一化，增强超边表示能力。
+        hedge_embedding = self.norm1(hedge_embedding + self.ffn(hedge_embedding))
+        return hedge_embedding
+
+
 class ViewLearner(nn.Module):
-    """
-    为超图中的每条 node-hyperedge 连接学习概率权重。
-    
-    逻辑：
-    1. 使用独立的 HypergraphConv 作为 encoder 提取特征
-    2. 聚合得到超边表示（与主模型 _get_embedding 逻辑一致，使用 mean pooling）
-    3. 将节点表示和对应超边表示拼接，通过 MLP 得到权重 logits
-    """
-    
-    def __init__(self, input_dim, hidden_dim=64, device=None):
-        """
-        Args:
-            input_dim: 输入特征维度 (对应 HyCoRec 的 kg_emb_dim)
-            hidden_dim: MLP 隐藏层维度
-            device: 计算设备
-        """
+    """Learn connection logits from node-hyperedge pairs."""
+
+    def __init__(self, input_dim, hidden_dim=64, device=None, hyperedge_aggregation='mean'):
         super(ViewLearner, self).__init__()
-        
+
+        # 只允许两种超边表示方式，便于配置管理。
+        if hyperedge_aggregation not in {'mean', 'attention'}:
+            raise ValueError(f'Unsupported hyperedge_aggregation: {hyperedge_aggregation}')
+
+        # 记录基础配置。
         self.input_dim = input_dim
         self.device = device
-        
-        # 独立的 encoder (与主模型结构相同但参数独立)
+        self.hyperedge_aggregation = hyperedge_aggregation
+
+        # 独立 encoder 先对节点做一次超图编码，再交给边权预测头使用。
         self.encoder = HypergraphConv(input_dim, input_dim)
-        
-        # MLP: [node_feat || hedge_feat] -> weight
+        # 边权头输入是“连接上的节点表示 + 对应超边表示”的拼接。
         self.mlp_edge_model = nn.Sequential(
             nn.Linear(input_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
-        
+        # 默认不启用 attention pooling，只有配置为 attention 时才创建模块。
+        self.attention_pool = None
+        if self.hyperedge_aggregation == 'attention':
+            self.attention_pool = HyperedgeAttentionPooling(input_dim, hidden_dim)
+
+        # 初始化所有可学习参数。
         self._init_weights()
-    
+
     def _init_weights(self):
-        """Xavier 初始化"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
+        # 统一初始化当前模块下所有线性层。
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def _aggregate_hyperedge_embedding(self, node_embedding, hyper_edge_index):
-        """
-        聚合得到超边表示（与主模型 _get_embedding 逻辑一致，使用 mean pooling）
-        
-        Args:
-            node_embedding: (num_nodes, input_dim) encoder 输出的节点特征
-            hyper_edge_index: (2, num_connections) [节点ID, 超边ID]
-        
-        Returns:
-            hedge_embedding: (num_hyperedges, input_dim) 超边表示
-        """
+        # incidence 矩阵第一行是节点，第二行是超边。
         node_ids = hyper_edge_index[0]
         hedge_ids = hyper_edge_index[1]
-        num_hedges = hedge_ids.max().item() + 1
-        
-        # scatter mean: 对每条超边内的节点取平均
-        node_emb = node_embedding[node_ids]  # (num_connections, dim)
-        hedge_emb = torch.zeros(num_hedges, self.input_dim, device=node_embedding.device)
-        
-        # 计算每条超边的节点数（用于 mean）
-        ones = torch.ones(node_ids.size(0), 1, device=node_embedding.device)
-        hedge_count = torch.zeros(num_hedges, 1, device=node_embedding.device)
-        hedge_count.scatter_add_(0, hedge_ids.unsqueeze(-1), ones)
-        hedge_count = hedge_count.clamp(min=1)  # 避免除零
-        
-        # 累加节点特征
-        hedge_emb.scatter_add_(
-            0,
-            hedge_ids.unsqueeze(-1).expand(-1, self.input_dim),
-            node_emb
-        )
-        # 取平均
-        hedge_emb = hedge_emb / hedge_count
-        
-        return hedge_emb
-    
+        # 计算当前子图中的超边数量。
+        num_hyperedges = int(hedge_ids.max().item()) + 1
+        # 取出所有连接对应的节点表示，mean 聚合时会直接用到。
+        incident_node_embedding = node_embedding[node_ids]
+
+        # attention 模式下，使用 PMA 风格聚合得到超边表示。
+        if self.hyperedge_aggregation == 'attention':
+            return self.attention_pool(node_embedding, hyper_edge_index)
+        # mean 模式下，直接按超边对 incident 节点求均值。
+        return _scatter_mean(incident_node_embedding, hedge_ids, num_hyperedges)
+
     def forward(self, node_features, hyper_edge_index):
-        """
-        Args:
-            node_features: (num_nodes, input_dim) 输入节点特征（来自 RGCN 编码后）
-            hyper_edge_index: (2, num_connections) 超图连接 [节点ID, 超边ID]
-        
-        Returns:
-            weight_logits: (num_connections, 1) 每条连接的权重 logits
-        """
-        # 1. 通过独立的 encoder 提取特征
+        # 先用独立 HypergraphConv 对输入节点特征做一次编码。
         encoded_node_feat = self.encoder(node_features, hyper_edge_index)
-        # encoded_node_feat: (num_nodes, input_dim)
-        
-        # 2. 聚合得到超边表示
+        # 再按配置的聚合方式生成每条超边的表示。
         hedge_embedding = self._aggregate_hyperedge_embedding(encoded_node_feat, hyper_edge_index)
-        # hedge_embedding: (num_hyperedges, input_dim)
-        
-        # 3. 获取每条连接对应的节点和超边特征
+
+        # 重新取出连接级的节点索引与超边索引。
         node_ids = hyper_edge_index[0]
         hedge_ids = hyper_edge_index[1]
-        
-        emb_node = encoded_node_feat[node_ids]   # (num_connections, dim)
-        emb_hedge = hedge_embedding[hedge_ids]    # (num_connections, dim)
-        
-        # 4. 拼接后通过 MLP 得到权重
-        total_emb = torch.cat([emb_node, emb_hedge], dim=1)  # (num_connections, dim*2)
-        weight_logits = self.mlp_edge_model(total_emb)       # (num_connections, 1)
-        
-        return weight_logits
+        # 对每条连接，拼接“该连接的节点表示”和“该连接所属超边表示”。
+        total_emb = torch.cat(
+            [encoded_node_feat[node_ids], hedge_embedding[hedge_ids]],
+            dim=1
+        )
+        # 通过 MLP 输出每条连接的权重 logits，并展平成一维。
+        return self.mlp_edge_model(total_emb).reshape(-1)

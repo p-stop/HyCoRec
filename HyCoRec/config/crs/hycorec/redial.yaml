@@ -47,6 +47,7 @@ view:
   pretrain_save_path: "./pretrain_models"  # 预训练模型保存目录
   # ===== ViewLearner 配置 =====
   use_counterfactual: true        ##!!       # 是否使用反事实训练
+  view_hidden_dim : 64              # ViewLearner 隐藏层维度
   view_lr: !!float 1e-4                  # ViewLearner 学习率
   view_wd: !!float 1e-4                  # ViewLearner 权重衰减
   view_alpha: 0.5                        # factual vs counterfactual 权重
@@ -54,6 +55,7 @@ view:
   model_lambda: 0.1                      # 主模型对比损失权重
   gamma: 0.5                             # hinge loss margin
   temperature: 1.0                       # gumbel softmax 温度
+  hyperedge_aggregation : 'attention'  # 超边聚合方式，'attention' 或 'mean'
 conv:
   epoch: 0
   batch_size: 128
