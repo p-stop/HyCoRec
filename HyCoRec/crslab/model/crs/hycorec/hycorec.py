@@ -35,6 +35,7 @@ from crslab.model.base import BaseModel
 from crslab.model.crs.hycorec.attention import MHItemAttention
 from crslab.model.utils.functions import edge_to_pyg_format
 from crslab.model.utils.modules.attention import SelfAttentionBatch, SelfAttentionSeq
+from crslab.model.utils.modules.weighted_hypergraph_conv import WeightedHypergraphConv
 from crslab.model.utils.modules.transformer import TransformerEncoder
 from crslab.model.crs.hycorec.decoder import TransformerDecoderKG
 
@@ -271,9 +272,9 @@ class HyCoRecModel(BaseModel):
         if self.pretrain:
             self.item_encoder.load_state_dict(self.pretrain_data['encoder'])
         # hypergraph convolution
-        self.hyper_conv_item = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        self.hyper_conv_entity = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        self.hyper_conv_word = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+        self.hyper_conv_item = WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+        self.hyper_conv_entity = WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+        self.hyper_conv_word = WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
         # attention type
         self.item_attn = MHItemAttention(self.kg_emb_dim, self.mha_n_heads)
         # pooling
