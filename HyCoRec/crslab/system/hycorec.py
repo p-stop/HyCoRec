@@ -52,6 +52,8 @@ class HyCoRecSystem(BaseSystem):
         self.conv_epoch = self.conv_optim_opt['epoch']
         self.rec_batch_size = self.rec_optim_opt['batch_size']
         self.conv_batch_size = self.conv_optim_opt['batch_size']
+
+        self.early_stop_metric = self.rec_optim_opt.get('early_stop_metric', 'rec_loss')
         
         # ViewLearner 超参数（从配置中读取，设置默认值）
         # 仿照 CACHE/train.py 的参数设置

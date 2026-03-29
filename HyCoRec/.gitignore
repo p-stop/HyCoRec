@@ -10,7 +10,7 @@ pretrain_models/
 log/
 wandb/
 wandb_sweep/
-
+config/
 # Python 缓存文件
 __pycache__/
 *.py[cod]
