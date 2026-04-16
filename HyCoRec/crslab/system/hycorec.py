@@ -17,6 +17,18 @@ from crslab.system.base import BaseSystem
 from crslab.system.utils.functions import ind2txt
 from crslab.model.crs.hycorec.hycorec import ViewLearner
 
+def _dump_debug_tensors(scores_orig_norm, scores_f, scores_cf):
+    """
+    Dump 3 tensors to local files for inspection.
+    Saved as .pt so you can reload with torch.load().
+    """
+    dump_dir =  "./debug_dumps"
+    os.makedirs(dump_dir, exist_ok=True)
+
+    # move to cpu to make files portable and smaller (no GPU tensors)
+    torch.save(scores_orig_norm.detach().cpu(), os.path.join(dump_dir, "scores_orig_norm"))
+    torch.save(scores_f.detach().cpu(),        os.path.join(dump_dir, "scores_f"))
+    torch.save(scores_cf.detach().cpu(),       os.path.join(dump_dir, "scores_cf"))
 
 def gumbel_softmax(logits, temperature=1.0):
     """Gumbel-Softmax trick for differentiable sampling"""
@@ -68,6 +80,7 @@ class HyCoRecSystem(BaseSystem):
         self.gamma = self.view_optim_opt.get('gamma', 0.5)            # hinge loss margin
         self.temperature = self.view_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
         self.use_counterfactual = self.view_optim_opt.get('use_counterfactual', True)
+        self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
         
         # 预训练模型加载配置
         # pretrain_model_path: 预训练模型路径，如果指定则跳过预训练直接加载
@@ -79,24 +92,34 @@ class HyCoRecSystem(BaseSystem):
         
         # 构建 ViewLearner（为三种超图各一个）
         # 注意：ViewLearner 需要能直接处理节点特征和超边索引
-        self.view_learner_item = ViewLearner(
-            self.kg_emb_dim,
-            self.view_hidden_dim,
-            self.device,
-            hyperedge_aggregation=self.view_hyperedge_aggregation
-        ).to(self.device)
-        self.view_learner_entity = ViewLearner(
-            self.kg_emb_dim,
-            self.view_hidden_dim,
-            self.device,
-            hyperedge_aggregation=self.view_hyperedge_aggregation
-        ).to(self.device)
-        self.view_learner_word = ViewLearner(
-            self.kg_emb_dim,
-            self.view_hidden_dim,
-            self.device,
-            hyperedge_aggregation=self.view_hyperedge_aggregation
-        ).to(self.device)
+        if(self.same_view):
+            self.view_learner_item = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+            self.view_learner_entity = self.view_learner_item  # 共享权重
+            self.view_learner_word = self.view_learner_item    # 共享权
+        else:
+            self.view_learner_item = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+            self.view_learner_entity = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+            self.view_learner_word = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
 
     def _core_model(self):
         """Return the underlying model for both plain and DataParallel wrappers."""
@@ -172,7 +195,7 @@ class HyCoRecSystem(BaseSystem):
             counterfactual_weights[graph_key] = graph_weights
         return counterfactual_weights
 
-    def rec_evaluate(self, rec_predict, item_label):
+    def rec_evaluate(self, rec_predict, item_label,type=""):
         rec_predict = rec_predict.cpu()
         rec_predict = rec_predict[:, self.item_ids]
         _, rec_ranks = torch.topk(rec_predict, 50, dim=-1)
@@ -181,7 +204,7 @@ class HyCoRecSystem(BaseSystem):
         # start = perf_counter()
         for rec_rank, label in zip(rec_ranks, item_label):
             label = self.item_ids.index(label)
-            self.evaluator.rec_evaluate(rec_rank, label)
+            self.evaluator.rec_evaluate(rec_rank, label,type=type)
         # print(f"{perf_counter() - start}")
 
     def conv_evaluate(self, prediction, response, batch_user_id=None, batch_conv_id=None):
@@ -228,6 +251,49 @@ class HyCoRecSystem(BaseSystem):
             else:
                 preds = self.model.forward(batch, mode, stage)
                 self.conv_evaluate(preds, batch['response'], batch.get('user_id', None), batch['conv_id'])
+
+    def rec_eval_with_weight(self, batch):
+
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(self.device)
+        
+        core_model = self._core_model()
+
+        prepared_batch = self._prepare_recommendation_batch(batch)
+
+        rec_loss, scores_orig,ground_truth= core_model.recommend_from_prepared_batch(prepared_batch)
+
+        batch_weights_f, weight_info = self._build_batch_hyperedge_weights(prepared_batch)
+
+        rec_f_loss, scores_f , _= core_model.recommend_from_prepared_batch(
+            prepared_batch,
+            batch_item_weights=batch_weights_f['item'],
+            batch_entity_weights=batch_weights_f['entity'],
+            batch_word_weights=batch_weights_f['word']
+        )
+
+        batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
+
+        rec_cf_loss, scores_cf ,_= core_model.recommend_from_prepared_batch(
+            prepared_batch,
+            batch_item_weights=batch_weights_cf['item'],
+            batch_entity_weights=batch_weights_cf['entity'],
+            batch_word_weights=batch_weights_cf['word']
+        )
+
+        self.rec_evaluate(scores_orig, ground_truth)
+        self.rec_evaluate(scores_f, ground_truth,type="f")
+        self.rec_evaluate(scores_cf, ground_truth,type="cf")
+
+        rec_loss = rec_loss.sum().item()
+        rec_f_loss = rec_f_loss.sum().item()
+        rec_cf_loss = rec_cf_loss.sum().item()
+
+        self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss))
+
+
+
 
     def train_recommender(self):
         """推荐模块训练（交替训练 ViewLearner 和主模型）"""
@@ -304,7 +370,8 @@ class HyCoRecSystem(BaseSystem):
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                    self.step(batch, stage='rec', mode='valid')
+                    self.rec_eval_with_weight(batch)
+                    # self.step(batch, stage='rec', mode='valid')
                 valid_report = self.evaluator.report(epoch=epoch, mode='valid')
                 self.log_wandb_metrics(valid_report, stage='rec', mode='valid', epoch=epoch)
                 # early stop
@@ -314,12 +381,23 @@ class HyCoRecSystem(BaseSystem):
                 if self.early_stop(metric):
                     break
         
-        # test
+            # test
+            logger.info('[Test]')
+            with torch.no_grad():
+                self.evaluator.reset_metrics()
+                for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
+                    self.rec_eval_with_weight(batch)
+                    # self.step(batch, stage='rec', mode='test')
+                test_report = self.evaluator.report(mode='test')
+                self.log_wandb_metrics(test_report, stage='rec', mode='test')
+
+                    # test
         logger.info('[Test]')
         with torch.no_grad():
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                self.step(batch, stage='rec', mode='test')
+                self.rec_eval_with_weight(batch)
+                # self.step(batch, stage='rec', mode='test')
             test_report = self.evaluator.report(mode='test')
             self.log_wandb_metrics(test_report, stage='rec', mode='test')
 
@@ -375,6 +453,24 @@ class HyCoRecSystem(BaseSystem):
         # 5. 计算事实损失和反事实损失
         # 原始分数先 detach，再 sigmoid 成为用于判别方向的软标签。
         scores_orig_norm = torch.sigmoid(scores_orig.detach())
+
+        # torch.set_printoptions(threshold=ground_truth.shape[0]*2)
+        # print("ground_truth:",scores_orig_norm)
+        # print("\n")
+        # print(scores_orig_norm.shape)
+        # print("\n")
+        # for i in range(2):
+        #     print(scores_f[i][ground_truth[i]])
+        #     print(" ")
+        # print("\n")
+        # print("scores_cf:",scores_cf)
+        # print("\n")
+        # for i in range(2):
+        #     print(scores_cf[i][ground_truth[i]])
+        #     print(" ")
+        # print('\n')
+        # _dump_debug_tensors(scores_orig_norm, scores_f, scores_cf)
+        
         # factual 目标：尽量保持与原始预测一致。
         loss_f = self.factual_loss(scores_orig_norm, scores_f)
         # counterfactual 目标：尽量与原始预测相反。

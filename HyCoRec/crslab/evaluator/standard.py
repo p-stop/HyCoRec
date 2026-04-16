@@ -44,12 +44,12 @@ class StandardEvaluator(BaseEvaluator):
         # optim
         self.optim_metrics = Metrics()
 
-    def rec_evaluate(self, ranks, label):
+    def rec_evaluate(self, ranks, label,type=""):
         for k in [1, 10, 50]:
             if len(ranks) >= k:
-                self.rec_metrics.add(f"recall@{k}", RECMetric.compute(ranks, label, k))
-                self.rec_metrics.add(f"ndcg@{k}", NDCGMetric.compute(ranks, label, k))
-                self.rec_metrics.add(f"mrr@{k}", MRRMetric.compute(ranks, label, k))
+                self.rec_metrics.add(f"recall@{type}{k}", RECMetric.compute(ranks, label, k))
+                self.rec_metrics.add(f"ndcg@{type}{k}", NDCGMetric.compute(ranks, label, k))
+                self.rec_metrics.add(f"mrr@{type}{k}", MRRMetric.compute(ranks, label, k))
 
     def gen_evaluate(self, hyp, refs, seq=None):
         if hyp:
