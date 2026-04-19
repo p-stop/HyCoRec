@@ -13,9 +13,11 @@ wandb_sweep/
 config/
 debug_dumps/
 scripts/
+queue_runs/
 # Python 缓存文件
 __pycache__/
 *.py[cod]
 *$py.class
+*.json
 
 

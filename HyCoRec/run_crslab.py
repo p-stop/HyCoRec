@@ -109,8 +109,8 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--seed', type=int, default=2020)
     parser.add_argument('-p', '--pretrain', action='store_true', help='use pretrain weights')
     parser.add_argument('-e', '--pretrain_epoch', type=int, default=9999, help='pretrain epoch')
-    parser.add_argument('--disable_wandb', action='store_true', help='disable wandb logging')
-    parser.add_argument('--wandb_project', type=str, default='HyCoRec', help='wandb project name')
+    parser.add_argument('--disw', action='store_true', help='disable wandb logging')
+    parser.add_argument('--wp', type=str, default='redail', help='wandb project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity/team')
     parser.add_argument('--wandb_name', type=str, default=None, help='wandb run name')
     parser.add_argument('--wandb_group', type=str, default=None, help='wandb run group')
@@ -124,10 +124,10 @@ if __name__ == '__main__':
     if override_config:
         _merge_dict(config.opt, override_config)
 
-    config['use_wandb'] = not args.disable_wandb
+    config['use_wandb'] = not args.disw
     config['wandb'] = {
-        'enable': not args.disable_wandb,
-        'project': args.wandb_project,
+        'enable': not args.disw,
+        'project': args.wp,
         'entity': args.wandb_entity,
         'name': _build_sweep_agent_run_name(args.wandb_name),
         'group': args.wandb_group,

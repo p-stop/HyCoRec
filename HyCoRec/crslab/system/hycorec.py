@@ -81,6 +81,7 @@ class HyCoRecSystem(BaseSystem):
         self.temperature = self.view_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
         self.use_counterfactual = self.view_optim_opt.get('use_counterfactual', True)
         self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
+        self.tem_decay = self.view_optim_opt.get('tem_decay', False)  # 是否启用温度衰减（调试用）
         
         # 预训练模型加载配置
         # pretrain_model_path: 预训练模型路径，如果指定则跳过预训练直接加载
@@ -337,13 +338,12 @@ class HyCoRecSystem(BaseSystem):
         for epoch in range(self.rec_epoch):
             self.evaluator.reset_metrics()
             logger.info(f'[Recommendation epoch {str(epoch)}]')
-            # self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
             
-            # # 每 50 个 epoch 衰减 view_lambda
-            # if (epoch + 1) % 50 == 0:
-            #     self.view_lambda *= 0.5
-            #     logger.info(f'[Decay view_lambda to {self.view_lambda}]')
-            #     self.log_wandb_metrics({'view_lambda': self.view_lambda}, stage='rec', mode='train', epoch=epoch)
+            if self.tem_decay :
+                # 每 50 个 epoch 衰减 view_lambda
+                if (epoch + 1) % 2 == 0:
+                    self.view_lambda *= 0.9
+                    logger.info(f'[Decay view_lambda to {self.view_lambda}]')
             
             logger.info('[Train]')
             for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
@@ -424,7 +424,7 @@ class HyCoRecSystem(BaseSystem):
         # 1. 原始预测（不带权重）
         with torch.no_grad():
             # 原始分数只作为目标参照，因此不保留梯度。
-            _, scores_orig = core_model.recommend_from_prepared_batch(prepared_batch)
+            _, scores_orig ,_= core_model.recommend_from_prepared_batch(prepared_batch)
 
         # 2. 当前 batch 先完成 GCN 与子图提取，再交给 ViewLearner 生成超边权重
         # 这里得到的是 factual 视图对应的超边权重，以及用于正则化统计的权重信息。
@@ -432,7 +432,7 @@ class HyCoRecSystem(BaseSystem):
         # batch_weights_f:(item/entity/word:各个bathc对应图的weight的list)；weight_info:(item/entity/word:三个长tensor用于正则化)
         # 3. 事实预测（带学习到的超边权重）
         # 将 factual 超边权重送入 HGCN，得到事实视图下的推荐分数。
-        _, scores_f = core_model.recommend_from_prepared_batch(
+        _, scores_f ,_= core_model.recommend_from_prepared_batch(
             prepared_batch,
             batch_item_weights=batch_weights_f['item'],
             batch_entity_weights=batch_weights_f['entity'],
@@ -443,7 +443,7 @@ class HyCoRecSystem(BaseSystem):
         # factual 的补权重对应 counterfactual 视图。
         batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
         # 将反事实权重送入 HGCN，得到 counterfactual 分数。
-        _, scores_cf = core_model.recommend_from_prepared_batch(
+        _, scores_cf ,_= core_model.recommend_from_prepared_batch(
             prepared_batch,
             batch_item_weights=batch_weights_cf['item'],
             batch_entity_weights=batch_weights_cf['entity'],
@@ -483,6 +483,8 @@ class HyCoRecSystem(BaseSystem):
         word_weight = weight_info['word']
         # 将三类图的平均保留权重相加，作为整体图稀疏度约束。
         aug_weight_mean = item_weight.mean() + entity_weight.mean() + word_weight.mean()
+        if self.same_view:
+            aug_weight_mean /= 3  # 如果三类图共享权重学习器，平均一下避免数值过大。
 
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
         # factual/counterfactual 损失控制视图质量，正则项控制不要过度删边。
@@ -532,7 +534,7 @@ class HyCoRecSystem(BaseSystem):
 
         # 1. 每个 batch 先完成 GCN 编码和当前 batch 子图提取
         # 原始视图不带权重，直接作为主任务基线损失。
-        rec_loss_orig, scores_orig = core_model.recommend_from_prepared_batch(prepared_batch)
+        rec_loss_orig, scores_orig,_= core_model.recommend_from_prepared_batch(prepared_batch)
 
         # 2. 再交给 ViewLearner 生成超边权重
         # 主模型训练时不更新 ViewLearner，因此这里用 no_grad。
@@ -541,7 +543,7 @@ class HyCoRecSystem(BaseSystem):
 
         # 3. 选择是否带权重地执行 HGCN
         # factual 视图：使用学习到的超边权重。
-        _, scores_f = core_model.recommend_from_prepared_batch(
+        _, scores_f ,_= core_model.recommend_from_prepared_batch(
             prepared_batch,
             batch_item_weights=batch_weights_f['item'],
             batch_entity_weights=batch_weights_f['entity'],
@@ -551,7 +553,7 @@ class HyCoRecSystem(BaseSystem):
         # 反事实视图：使用 factual 权重的补集。
         batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
         # 反事实 HGCN 前向，用于构造对比约束。
-        _, scores_cf = core_model.recommend_from_prepared_batch(
+        _, scores_cf ,_= core_model.recommend_from_prepared_batch(
             prepared_batch,
             batch_item_weights=batch_weights_cf['item'],
             batch_entity_weights=batch_weights_cf['entity'],
@@ -582,38 +584,6 @@ class HyCoRecSystem(BaseSystem):
         self.evaluator.optim_metrics.add("model_loss", AverageMetric(model_loss.item()))
         self.evaluator.optim_metrics.add("main_loss_f", AverageMetric(loss_f.item()))    
         self.evaluator.optim_metrics.add("main_loss_cf", AverageMetric(loss_cf.item()))
-
-    def factual_loss(self, scores_orig_norm, scores_f):
-        """
-        事实损失：鼓励事实预测与原始预测一致
-        
-        当原始预测高分时（认为是正样本），事实预测也应该高
-        当原始预测低分时（认为是负样本），事实预测也应该低
-        """
-        # 使用 scores 的相对排名来确定正负
-        coef = scores_orig_norm.detach().clone()
-        coef[scores_orig_norm >= 0.5] = 1
-        coef[scores_orig_norm < 0.5] = -1
-        
-        # hinge loss: max(0, γ + coef * (0 - scores_f))
-        # 当 coef=1 时，希望 scores_f 高，所以 0 - scores_f 应该负
-        # 当 coef=-1 时，希望 scores_f 低，所以 0 - scores_f 应该正
-        loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_f), min=0))
-        return loss
-
-    def counterfactual_loss(self, scores_orig_norm, scores_cf):
-        """
-        反事实损失：鼓励反事实预测与原始预测相反
-        
-        当原始预测高分时，反事实预测应该低
-        当原始预测低分时，反事实预测应该高
-        """
-        coef = scores_orig_norm.detach().clone()
-        coef[scores_orig_norm >= 0.5] = -1  # 原来高，现在希望低
-        coef[scores_orig_norm < 0.5] = 1    # 原来低，现在希望高
-        
-        loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_cf), min=0))
-        return loss
 
     def train_conversation(self):
         self._core_model().freeze_parameters()
@@ -654,6 +624,38 @@ class HyCoRecSystem(BaseSystem):
 
     def interact(self):
         pass
+
+    def factual_loss(self, scores_orig_norm, scores_f):
+        """
+        事实损失：鼓励事实预测与原始预测一致
+        
+        当原始预测高分时（认为是正样本），事实预测也应该高
+        当原始预测低分时（认为是负样本），事实预测也应该低
+        """
+        # 使用 scores 的相对排名来确定正负
+        coef = scores_orig_norm.detach().clone()
+        coef[scores_orig_norm >= 0.5] = 1
+        coef[scores_orig_norm < 0.5] = -1
+        
+        # hinge loss: max(0, γ + coef * (0 - scores_f))
+        # 当 coef=1 时，希望 scores_f 高，所以 0 - scores_f 应该负
+        # 当 coef=-1 时，希望 scores_f 低，所以 0 - scores_f 应该正
+        loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_f), min=0))
+        return loss
+
+    def counterfactual_loss(self, scores_orig_norm, scores_cf):
+        """
+        反事实损失：鼓励反事实预测与原始预测相反
+        
+        当原始预测高分时，反事实预测应该低
+        当原始预测低分时，反事实预测应该高
+        """
+        coef = scores_orig_norm.detach().clone()
+        coef[scores_orig_norm >= 0.5] = -1  # 原来高，现在希望低
+        coef[scores_orig_norm < 0.5] = 1    # 原来低，现在希望高
+        
+        loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_cf), min=0))
+        return loss
 
     def _get_pretrain_model_filename(self):
         """Return the configured pretrain model filename."""

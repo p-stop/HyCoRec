@@ -668,7 +668,7 @@ class HyCoRecModel(BaseModel):
         scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)
         # 交叉熵损失仍使用原始 item 标签监督。
         loss = self.rec_loss(scores, prepared_batch['item'])
-        return loss, scores
+        return loss, scores, prepared_batch['item']
 
     def build_batch_hyperedge_weights(self, prepared_batch, item_weight_fn=None,
                                       entity_weight_fn=None, word_weight_fn=None):
