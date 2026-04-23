@@ -679,9 +679,6 @@ class HyCoRecModel(BaseModel):
             item_weight = batch_item_weights[idx] if batch_item_weights is not None else None
             entity_weight = batch_entity_weights[idx] if batch_entity_weights is not None else None
             word_weight = batch_word_weights[idx] if batch_word_weights is not None else None
-            # check("item_weight", item_weight)
-            # check("entity_weight", entity_weight)
-            # check("word_weight", word_weight)
             # item/entity/word 三类子图各自执行带权或不带权的 HGCN。
             item_embedding = self._run_hypergraph_conv(sample_graph['item'], self.hyper_conv_item, item_weight)
             entity_embedding = self._run_hypergraph_conv(sample_graph['entity'], self.hyper_conv_entity, entity_weight)
@@ -690,9 +687,6 @@ class HyCoRecModel(BaseModel):
             _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].entity_embedding', entity_embedding)
             _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].word_embedding', word_embedding)
             _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].context_embedding', sample_graph['context_embedding'])
-            # check("item_embd", item_embedding)
-            # check("entity_embd", entity_embedding)
-            # check("word_embd", word_embedding)
             # 将三路子图表示和上下文表示融合成单个用户向量。
             user_repr = self._attention_and_gating(
                 item_embedding,
@@ -722,7 +716,6 @@ class HyCoRecModel(BaseModel):
         # 推荐打分始终与 entity 编码后的整图实体向量做线性匹配。
         entity_embedding = prepared_batch['kg_embeddings']['entity']
         _numeric_debug_tensor(self, 'recommend_from_prepared_batch.entity_embedding', entity_embedding)
-        # check("user_embd", user_embedding)
         scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)
         _numeric_debug_tensor(self, 'recommend_from_prepared_batch.scores', scores)
         # 交叉熵损失仍使用原始 item 标签监督。
@@ -1128,14 +1121,11 @@ class ViewLearner(nn.Module):
     def forward(self, node_features, hyper_edge_index):
         # 先用独立 HypergraphConv 对输入节点特征做一次编码。
         _numeric_debug_tensor(self, 'ViewLearner.forward.node_features_input', node_features)
-        check("node_features", node_features,"view learner forward")
         encoded_node_feat = self.encoder(node_features, hyper_edge_index)
         _numeric_debug_tensor(self, 'ViewLearner.forward.encoded_node_feat', encoded_node_feat)
-        check("encoded_node_feat", encoded_node_feat,"view learner forward")
         # 再按配置的聚合方式生成每条超边的表示。
         hedge_embedding = self._aggregate_hyperedge_embedding(encoded_node_feat, hyper_edge_index)
         _numeric_debug_tensor(self, 'ViewLearner.forward.hedge_embedding', hedge_embedding)
-        check("hedge_embedding", hedge_embedding,"view learner forward")
 
         # 重新取出连接级的节点索引与超边索引。
         node_ids = hyper_edge_index[0]

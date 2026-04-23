@@ -8,6 +8,7 @@ import json
 from time import perf_counter
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pickle as pkl
 from loguru import logger
 
@@ -88,6 +89,7 @@ class HyCoRecSystem(BaseSystem):
         self.conv_batch_size = self.conv_optim_opt['batch_size']
 
         self.rec_early_stop_metric = self.rec_optim_opt.get('early_stop_metric', 'rec_loss')
+        self.bef_loss = 100000.0
         
         # ViewLearner 超参数（从配置中读取，设置默认值）
         # 仿照 CACHE/train.py 的参数设置
@@ -104,6 +106,11 @@ class HyCoRecSystem(BaseSystem):
         self.use_counterfactual = self.view_optim_opt.get('use_counterfactual', True)
         self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
         self.tem_decay = self.view_optim_opt.get('tem_decay', False)  # 是否启用温度衰减（调试用）
+        self.loss_tau = self.view_optim_opt.get('loss_tau', self.view_optim_opt.get('tau', 1.0))  # KL 蒸馏温度
+        self.loss_topk = self.view_optim_opt.get('loss_topk', self.view_optim_opt.get('topk', 50))  # 排名损失使用的 top-k
+        self.loss_neg_k = self.view_optim_opt.get('loss_neg_k', self.view_optim_opt.get('neg_k', 50))  # top-k 对比负样本数
+
+
         self.nan_debug = self.view_optim_opt.get('debug_nan', True)
         self.nan_debug_raise = self.view_optim_opt.get('debug_nan_raise', True)
         self.nan_debug_anomaly = self.view_optim_opt.get('debug_nan_anomaly', True)
@@ -367,25 +374,18 @@ class HyCoRecSystem(BaseSystem):
             batch_word_weights=batch_weights_cf['word']
         )
 
-        loss_f = self.factual_loss(scores_f,ground_truth)
-        loss_cf = self.counterfactual_loss(scores_cf,ground_truth)
-        
-        rec_loss = rec_loss.sum()
-        model_loss = rec_loss + self.model_lambda * (
-            self.view_alpha * loss_f + (1 - self.view_alpha) * loss_cf
-        )
+        loss_f = self.factual_loss(scores_orig, scores_f)
+        loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
 
         self.rec_evaluate(scores_orig, ground_truth)
         self.rec_evaluate(scores_f, ground_truth,type="f")
         self.rec_evaluate(scores_cf, ground_truth,type="cf")
 
-        rec_loss = rec_loss.item()
-        rec_f_loss = rec_f_loss.sum().item()
-        rec_cf_loss = rec_cf_loss.sum().item()
-        model_loss = model_loss.item()
+        rec_loss = rec_loss.sum().item()
 
         self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss))
-        self.evaluator.optim_metrics.add("model_loss", AverageMetric(model_loss))
+        self.evaluator.optim_metrics.add("loss_f", AverageMetric(loss_f.item()))
+        self.evaluator.optim_metrics.add("loss_cf", AverageMetric(loss_cf.item()))
 
 
 
@@ -476,7 +476,7 @@ class HyCoRecSystem(BaseSystem):
             self.log_wandb_metrics(train_report, stage='rec', mode='train', epoch=epoch)
             
             # val
-            logger.info('[Valid]')
+            logger.info('[Valid_lr]')
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
@@ -488,6 +488,23 @@ class HyCoRecSystem(BaseSystem):
                 metric = valid_report.get(
                     self.rec_early_stop_metric,
                 )
+                # now_loss = valid_report.get("view_loss", None)
+                # if now_loss is None:
+                #     # valid 阶段未统计 view_loss（例如只调用了 rec_eval_with_weight）
+                #     # logger.warning('[Valid_lr] view_loss not found in valid_report; skip view_lr decay logic.')
+                #     a = 0
+                # else:
+                #     delta_loss = self.bef_loss - now_loss
+                #     if now_loss > 0.6:
+                #         if (-self.bef_loss * 0.05) < delta_loss < (self.bef_loss * 0.05):
+                #             self.view_lr *= 0.1
+                #             self.view_wd *= 0.1
+                #             logger.info(
+                #                 f'[{epoch}] no significant improvement in view_loss. '
+                #                 f'Decay view_lr to {self.view_lr}, view_wd to {self.view_wd}'
+                #             )
+                #     # 更新基准 loss，供下个 epoch 比较
+                #     self.bef_loss = now_loss           
                 if self.early_stop(metric):
                     break
         
@@ -571,34 +588,15 @@ class HyCoRecSystem(BaseSystem):
         self._debug_check_tensor('train_view_learner_step.scores_cf', scores_cf)
         
         # 5. 计算事实损失和反事实损失
-        # 原始分数先 detach，再 sigmoid 成为用于判别方向的软标签。
-        scores_orig_norm = torch.sigmoid(scores_orig.detach())
-        self._debug_check_tensor('train_view_learner_step.scores_orig_norm', scores_orig_norm)
-
-        # torch.set_printoptions(threshold=ground_truth.shape[0]*2)
-        # print("ground_truth:",scores_orig_norm)
-        # print("\n")
-        # print(scores_orig_norm.shape)
-        # print("\n")
-        # for i in range(2):
-        #     print(scores_f[i][ground_truth[i]])
-        #     print(" ")
-        # print("\n")
-        # print("scores_cf:",scores_cf)
-        # print("\n")
-        # for i in range(2):
-        #     print(scores_cf[i][ground_truth[i]])
-        #     print(" ")
-        # print('\n')
-        # _dump_debug_tensors(scores_orig_norm, scores_f, scores_cf)
-        
-        # factual 目标：尽量保持与原始预测一致。
-        loss_f = self.factual_loss(scores_f,targets)
+        # 原始分数只作为 teacher logits，不参与梯度传播。
+        scores_orig = scores_orig.detach()
+        self._debug_check_tensor('train_view_learner_step.scores_orig_norm', scores_orig)
+        # factual 分数应尽量贴近原始分数的偏好方向。
+        loss_f = self.factual_loss(scores_orig, scores_f)
         self._debug_check_tensor('train_view_learner_step.loss_f', loss_f)
         # counterfactual 目标：尽量与原始预测相反。
-        loss_cf = self.counterfactual_loss(scores_cf,targets)
+        loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
         self._debug_check_tensor('train_view_learner_step.loss_cf', loss_cf)
-        
         # 6. 计算边权重正则化（鼓励保留更多边）
         # 分别取三类图的超边权重。
         item_weight = weight_info['item']
@@ -715,16 +713,16 @@ class HyCoRecSystem(BaseSystem):
         )
         self._debug_check_tensor('train_main_model_step.scores_cf', scores_cf)
         
-        # 4. 计算事实/反事实损失
-        # 原始分数只作为方向标签，不参与梯度传播。
-        scores_orig_norm = torch.sigmoid(scores_orig.detach())
-        self._debug_check_tensor('train_main_model_step.scores_orig_norm', scores_orig_norm)
+        # 5. 计算事实损失和反事实损失
+        # 原始分数只作为 teacher logits，不参与梯度传播。
+        scores_orig = scores_orig.detach()
+        self._debug_check_tensor('train_view_learner_step.scores_orig_norm', scores_orig)
         # factual 分数应尽量贴近原始分数的偏好方向。
-        loss_f = self.factual_loss(scores_f,targets)
-        self._debug_check_tensor('train_main_model_step.loss_f', loss_f)
-        # counterfactual 分数应尽量背离原始分数的偏好方向。
-        loss_cf = self.counterfactual_loss(scores_cf,targets)
-        self._debug_check_tensor('train_main_model_step.loss_cf', loss_cf)
+        loss_f = self.factual_loss(scores_orig, scores_f)
+        self._debug_check_tensor('train_view_learner_step.loss_f', loss_f)
+        # counterfactual 目标：尽量与原始预测相反。
+        loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
+        self._debug_check_tensor('train_view_learner_step.loss_cf', loss_cf)
         
         # 5. model_loss = rec_loss + λ_model * (α * loss_f + (1-α) * loss_cf)
         # 主任务交叉熵仍是核心，视图对比损失作为辅助约束。
@@ -783,41 +781,123 @@ class HyCoRecSystem(BaseSystem):
     def interact(self):
         pass
 
-    def factual_loss(self, scores_orig_norm, scores_f):
-        """
-        事实损失：鼓励事实预测与原始预测一致
-        
-        当原始预测高分时（认为是正样本），事实预测也应该高
-        当原始预测低分时（认为是负样本），事实预测也应该低
-        """
-        # 使用 scores 的相对排名来确定正负
-        self._debug_check_tensor('factual_loss.scores_orig_norm', scores_orig_norm)
-        self._debug_check_tensor('factual_loss.scores_f', scores_f)
-        coef = scores_orig_norm.detach().clone()
-        coef[scores_orig_norm >= 0.5] = 1
-        coef[scores_orig_norm < 0.5] = -1
-        
-        # hinge loss: max(0, γ + coef * (0 - scores_f))
-        # 当 coef=1 时，希望 scores_f 高，所以 0 - scores_f 应该负
-        # 当 coef=-1 时，希望 scores_f 低，所以 0 - scores_f 应该正
-        loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_f), min=0))
-        return loss
+    def _get_teacher_topk(self, scores_orig, tk):
+        #特判
+        B, N = scores_orig.shape
+        if N <= 1:
+            empty_idx = torch.empty(B, 0, dtype=torch.long, device=scores_orig.device)
+            empty_w = scores_orig.new_empty(B, 0)
+            return empty_idx, empty_w
+        tk = min(max(int(tk), 1), N - 1)
 
-    def counterfactual_loss(self, scores_orig_norm, scores_cf):
+        topk_vals, topk_idx = torch.topk(scores_orig, tk, dim=1)
+        topk_w = F.softmax(topk_vals, dim=1)
+        return topk_idx, topk_w
+
+    def factual_loss(self, scores_orig, scores_f):
         """
-        反事实损失：鼓励反事实预测与原始预测相反
-        
-        当原始预测高分时，反事实预测应该低
-        当原始预测低分时，反事实预测应该高
+        事实损失：宏观上保证 factual 分布与原始分布一致。
         """
-        self._debug_check_tensor('counterfactual_loss.scores_orig_norm', scores_orig_norm)
-        self._debug_check_tensor('counterfactual_loss.scores_cf', scores_cf)
-        coef = scores_orig_norm.detach().clone()
-        coef[scores_orig_norm >= 0.5] = -1  # 原来高，现在希望低
-        coef[scores_orig_norm < 0.5] = 1    # 原来低，现在希望高
+        # # 版本 1（当前启用）：KL(softmax(z_orig / tau) || softmax(z_f / tau))
+        # tau = max(float(self.loss_tau), 1e-8)
+        # teacher_prob = F.softmax(scores_orig / tau, dim=-1)
+        # factual_log_prob = F.log_softmax(scores_f / tau, dim=-1)
+        # return F.kl_div(factual_log_prob, teacher_prob, reduction='batchmean')
+
+        # 版本 2（备用，已注释）：topk 仍是 topk
+        # 特判
+        B, N = scores_f.shape
+        tk = min(max(int(self.loss_topk), 1), N - 1)
+        neg_k = min(max(int(self.loss_neg_k), 1), N - tk)
         
-        loss = torch.mean(torch.clamp(self.gamma + coef * (0 - scores_cf), min=0))
-        return loss
+        pos_idx, pos_w = self._get_teacher_topk(scores_orig, tk)
+        pos_scores = scores_f.gather(1, pos_idx)
+        
+        mask = torch.zeros_like(scores_f, dtype=torch.bool)
+        mask.scatter_(1, pos_idx, True)
+        
+        neg_pool = scores_f.masked_fill(mask, -1e9)
+        neg_scores = torch.topk(neg_pool, neg_k, dim=1).values
+        
+        pair_loss = F.softplus(
+            self.gamma - pos_scores.unsqueeze(-1) + neg_scores.unsqueeze(1)
+        )
+        return pair_loss.mean()
+
+        # 版本 3（备用，已注释）：topk > bottomk
+        # B, N = scores_f.shape
+        # if N <= 1:
+        #     return scores_f.sum() * 0.0
+        
+        # tk = min(max(int(self.loss_topk), 1), N // 2)
+        # top_idx = torch.topk(scores_orig.detach(), tk, dim=1).indices
+        # bottom_idx = torch.topk(scores_orig.detach(), tk, dim=1, largest=False).indices
+        
+        # top_scores = scores_f.gather(1, top_idx)
+        # bottom_scores = scores_f.gather(1, bottom_idx)
+        # pair_loss = torch.clamp(
+        #     self.gamma - top_scores.unsqueeze(-1) + bottom_scores.unsqueeze(1),
+        #     min=0
+        # )
+        # return pair_loss.mean()
+
+    def counterfactual_loss(self, scores_orig, scores_cf):
+        """
+        反事实损失：多分类场景下鼓励 counterfactual 结果与事实预测不同。
+
+        注意：这里沿用 scores_orig 的旧参数名，但实际传入的是未 softmax 的原始 logits。
+        """
+        # # 版本 1（当前启用）：原 top1 被原 top(k+1) 反超
+        # #特判
+        # B, N = scores_cf.shape
+        # if N <= 1:
+        #     return scores_cf.sum() * 0.0
+        # tk = min(max(int(self.loss_topk), 1), N - 1)
+
+        # ranked_idx = torch.topk(scores_orig, tk + 1, dim=1).indices
+        # top1_idx = ranked_idx[:, :1]
+        # challenger_idx = ranked_idx[:, tk:tk + 1]
+
+        # top1_score = scores_cf.gather(1, top1_idx)
+        # challenger_score = scores_cf.gather(1, challenger_idx)
+        # return F.softplus(self.gamma + top1_score - challenger_score).mean()
+
+        # 版本 2（备用，已注释）：topk < bottomk
+        # B, N = scores_cf.shape
+        # if N <= 1:
+        #     return scores_cf.sum() * 0.0
+        
+        # tk = min(max(int(self.loss_topk), 1), N // 2)
+        # top_idx = torch.topk(scores_orig.detach(), tk, dim=1).indices
+        # bottom_idx = torch.topk(scores_orig.detach(), tk, dim=1, largest=False).indices
+        
+        # top_scores = scores_cf.gather(1, top_idx)
+        # bottom_scores = scores_cf.gather(1, bottom_idx)
+        # pair_loss = torch.clamp(
+        #     self.gamma + top_scores.unsqueeze(-1) - bottom_scores.unsqueeze(1),
+        #     min=0
+        # )
+        # return pair_loss.mean()
+
+        # 版本 3（备用，已注释）：topk 不是 topk
+        # 特判
+        B, N = scores_cf.shape
+        tk = min(max(int(self.loss_topk), 1), N - 1)
+        neg_k = min(max(int(self.loss_neg_k), 1), N - tk)
+        
+        pos_idx, pos_w = self._get_teacher_topk(scores_orig, tk)
+        pos_scores = scores_cf.gather(1, pos_idx)
+        
+        mask = torch.zeros_like(scores_cf, dtype=torch.bool)
+        mask.scatter_(1, pos_idx, True)
+        
+        neg_pool = scores_cf.masked_fill(mask, -1e9)
+        neg_scores = torch.topk(neg_pool, neg_k, dim=1).values
+        
+        pair_loss = F.softplus(
+            self.gamma + pos_scores.unsqueeze(-1) - neg_scores.unsqueeze(1)
+        )
+        return pair_loss.mean()
     def _get_pretrain_model_filename(self):
         """Return the configured pretrain model filename."""
         if self.pretrain_model_name:
