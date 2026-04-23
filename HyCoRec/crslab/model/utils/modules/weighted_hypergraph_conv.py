@@ -1,15 +1,65 @@
 from typing import Optional
+import inspect
+import os
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Parameter
+from loguru import logger
 
 from torch_geometric.experimental import disable_dynamic_shapes
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.nn.dense.linear import Linear
 from torch_geometric.nn.inits import glorot, zeros
 from torch_geometric.utils import scatter, softmax
+
+
+def _numeric_debug_location():
+    frame = inspect.currentframe()
+    if frame is None or frame.f_back is None or frame.f_back.f_back is None:
+        return 'unknown'
+    caller = frame.f_back.f_back
+    return f'{os.path.basename(caller.f_code.co_filename)}:{caller.f_lineno}'
+
+
+def _numeric_debug_tensor(owner, name, tensor):
+    if not getattr(owner, 'nan_debug', False):
+        return True
+    if not isinstance(tensor, torch.Tensor):
+        return True
+    if not (tensor.is_floating_point() or tensor.is_complex()):
+        return True
+    if torch.isfinite(tensor).all().item():
+        return True
+
+    with torch.no_grad():
+        detached = tensor.detach()
+        finite_mask = torch.isfinite(detached)
+        finite_count = int(finite_mask.sum().item())
+        total = detached.numel()
+        stats = {
+            'shape': tuple(detached.shape),
+            'dtype': str(detached.dtype),
+            'device': str(detached.device),
+            'finite': f'{finite_count}/{total}',
+            'nan': int(torch.isnan(detached).sum().item()) if detached.is_floating_point() else 0,
+            '+inf': int(torch.isposinf(detached).sum().item()) if detached.is_floating_point() else 0,
+            '-inf': int(torch.isneginf(detached).sum().item()) if detached.is_floating_point() else 0,
+        }
+        if finite_count > 0:
+            finite_vals = detached[finite_mask].float()
+            stats.update({
+                'min': float(finite_vals.min().item()),
+                'max': float(finite_vals.max().item()),
+                'mean': float(finite_vals.mean().item()),
+            })
+
+    message = f"[NUMERIC DEBUG] non-finite tensor '{name}' at {_numeric_debug_location()} stats={stats}"
+    logger.error(message)
+    if getattr(owner, 'nan_debug_raise', True):
+        raise FloatingPointError(message)
+    return False
 
 
 class WeightedHypergraphConv(MessagePassing):
@@ -117,7 +167,11 @@ class WeightedHypergraphConv(MessagePassing):
                     f"{incidence_weight.numel()}."
                 )
 
+        _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.x_input', x)
+        _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.hyperedge_weight_input', hyperedge_weight)
+        _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.incidence_weight_input', incidence_weight)
         x = self.lin(x)
+        _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.x_after_lin', x)
 
         alpha = None
         if self.use_attention:
@@ -145,8 +199,10 @@ class WeightedHypergraphConv(MessagePassing):
                 dim_size=num_nodes,
                 reduce="sum",
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.unweighted.d_before_inv', d_inv)
             d_inv = 1.0 / d_inv
             d_inv[d_inv == float("inf")] = 0
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.unweighted.d_inv', d_inv)
 
             b_inv = scatter(
                 x.new_ones(hyperedge_index.size(1)),
@@ -155,8 +211,10 @@ class WeightedHypergraphConv(MessagePassing):
                 dim_size=num_edges,
                 reduce="sum",
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.unweighted.b_before_inv', b_inv)
             b_inv = 1.0 / b_inv
             b_inv[b_inv == float("inf")] = 0
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.unweighted.b_inv', b_inv)
 
             out = self.propagate(
                 hyperedge_index,
@@ -166,6 +224,7 @@ class WeightedHypergraphConv(MessagePassing):
                 incidence_weight=None,
                 size=(num_nodes, num_edges),
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.unweighted.after_node_to_edge', out)
             out = self.propagate(
                 hyperedge_index.flip([0]),
                 x=out,
@@ -174,6 +233,7 @@ class WeightedHypergraphConv(MessagePassing):
                 incidence_weight=None,
                 size=(num_edges, num_nodes),
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.unweighted.after_edge_to_node', out)
         else:
             node_ids = hyperedge_index[0]
             hyperedge_ids = hyperedge_index[1]
@@ -187,8 +247,10 @@ class WeightedHypergraphConv(MessagePassing):
                 dim_size=num_nodes,
                 reduce="sum",
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.weighted.d_before_inv', d_inv)
             d_inv = 1.0 / d_inv
             d_inv[d_inv == float("inf")] = 0
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.weighted.d_inv', d_inv)
 
             # Hyperedge degree becomes the weighted sum of its incident nodes.
             b_inv = scatter(
@@ -198,8 +260,10 @@ class WeightedHypergraphConv(MessagePassing):
                 dim_size=num_edges,
                 reduce="sum",
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.weighted.b_before_inv', b_inv)
             b_inv = 1.0 / b_inv
             b_inv[b_inv == float("inf")] = 0
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.weighted.b_inv', b_inv)
 
             # First pass: node -> hyperedge using B^{-1} H^T.
             out = self.propagate(
@@ -210,6 +274,7 @@ class WeightedHypergraphConv(MessagePassing):
                 incidence_weight=incidence_weight,
                 size=(num_nodes, num_edges),
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.weighted.after_node_to_edge', out)
             # Second pass: hyperedge -> node using D^{-1} H W.
             out = self.propagate(
                 hyperedge_index.flip([0]),
@@ -219,6 +284,7 @@ class WeightedHypergraphConv(MessagePassing):
                 incidence_weight=incidence_weight * hyperedge_weight[hyperedge_ids],
                 size=(num_edges, num_nodes),
             )
+            _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.weighted.after_edge_to_node', out)
 
         if self.concat is True:
             out = out.view(-1, self.heads * self.out_channels)
@@ -227,6 +293,7 @@ class WeightedHypergraphConv(MessagePassing):
 
         if self.bias is not None:
             out = out + self.bias
+        _numeric_debug_tensor(self, 'WeightedHypergraphConv.forward.output', out)
 
         return out
 

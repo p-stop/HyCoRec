@@ -13,6 +13,8 @@
 # @Email  : oran_official@outlook.com
 
 import os
+import contextlib
+import inspect
 from abc import ABC, abstractmethod
 import numpy as np
 import random
@@ -260,12 +262,24 @@ class BaseSystem(ABC):
         Args:
             loss (torch.Tensor):
         """
+        if getattr(self, 'nan_debug', False):
+            self._debug_check_tensor('BaseSystem.backward.loss_before_zero_grad', loss)
         self._zero_grad()
 
         if self.update_freq > 1:
             self._number_grad_accum = (self._number_grad_accum + 1) % self.update_freq
             loss /= self.update_freq
-        loss.backward(loss.clone().detach())
+            if getattr(self, 'nan_debug', False):
+                self._debug_check_tensor('BaseSystem.backward.loss_after_update_freq', loss)
+
+        if getattr(self, 'nan_debug', False):
+            grad_tensor = loss.clone().detach()
+            self._debug_check_tensor('BaseSystem.backward.explicit_grad_tensor', grad_tensor)
+            with self._debug_anomaly_context():
+                loss.backward(grad_tensor)
+            self._debug_check_gradients('BaseSystem.backward.after_backward')
+        else:
+            loss.backward(loss.clone().detach())
 
         self._update_params()
 
@@ -287,6 +301,8 @@ class BaseSystem(ABC):
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.parameters, self.gradient_clip
             )
+            if getattr(self, 'nan_debug', False):
+                self._debug_check_tensor('BaseSystem._update_params.grad_norm_after_clip', grad_norm)
             self.evaluator.optim_metrics.add('grad norm', AverageMetric(grad_norm))
             self.evaluator.optim_metrics.add(
                 'grad clip ratio',
@@ -294,12 +310,83 @@ class BaseSystem(ABC):
             )
         else:
             grad_norm = compute_grad_norm(self.parameters)
+            if getattr(self, 'nan_debug', False):
+                self._debug_check_tensor('BaseSystem._update_params.grad_norm', torch.as_tensor(grad_norm))
             self.evaluator.optim_metrics.add('grad norm', AverageMetric(grad_norm))
 
         self.optimizer.step()
+        if getattr(self, 'nan_debug', False):
+            self._debug_check_parameters('BaseSystem._update_params.after_optimizer_step')
 
         if hasattr(self, 'scheduler'):
             self.scheduler.train_step()
+
+    def _debug_anomaly_context(self):
+        if getattr(self, 'nan_debug', False) and getattr(self, 'nan_debug_anomaly', True):
+            return torch.autograd.detect_anomaly()
+        return contextlib.nullcontext()
+
+    def _debug_location(self):
+        frame = inspect.currentframe()
+        if frame is None or frame.f_back is None or frame.f_back.f_back is None:
+            return 'unknown'
+        caller = frame.f_back.f_back
+        return f'{os.path.basename(caller.f_code.co_filename)}:{caller.f_lineno}'
+
+    def _debug_tensor_stats(self, tensor):
+        with torch.no_grad():
+            detached = tensor.detach()
+            finite_mask = torch.isfinite(detached)
+            finite_count = int(finite_mask.sum().item())
+            total = detached.numel()
+            stats = {
+                'shape': tuple(detached.shape),
+                'dtype': str(detached.dtype),
+                'device': str(detached.device),
+                'finite': f'{finite_count}/{total}',
+                'nan': int(torch.isnan(detached).sum().item()) if detached.is_floating_point() else 0,
+                '+inf': int(torch.isposinf(detached).sum().item()) if detached.is_floating_point() else 0,
+                '-inf': int(torch.isneginf(detached).sum().item()) if detached.is_floating_point() else 0,
+            }
+            if finite_count > 0:
+                finite_vals = detached[finite_mask].float()
+                stats.update({
+                    'min': float(finite_vals.min().item()),
+                    'max': float(finite_vals.max().item()),
+                    'mean': float(finite_vals.mean().item()),
+                })
+            return stats
+
+    def _debug_check_tensor(self, name, tensor):
+        if not getattr(self, 'nan_debug', False):
+            return True
+        if not isinstance(tensor, torch.Tensor):
+            return True
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            return True
+        if torch.isfinite(tensor).all().item():
+            return True
+
+        message = (
+            f"[NUMERIC DEBUG] non-finite tensor '{name}' at {self._debug_location()} "
+            f"stats={self._debug_tensor_stats(tensor)} context={getattr(self, '_debug_context', {})}"
+        )
+        logger.error(message)
+        if getattr(self, 'nan_debug_raise', True):
+            raise FloatingPointError(message)
+        return False
+
+    def _debug_check_gradients(self, name):
+        for param_name, param in self.model.named_parameters():
+            if param.grad is not None and not self._debug_check_tensor(f'{name}.grad.{param_name}', param.grad):
+                return False
+        return True
+
+    def _debug_check_parameters(self, name):
+        for param_name, param in self.model.named_parameters():
+            if not self._debug_check_tensor(f'{name}.param.{param_name}', param):
+                return False
+        return True
 
     def adjust_lr(self, metric=None):
         """adjust learning rate w/o metric by scheduler

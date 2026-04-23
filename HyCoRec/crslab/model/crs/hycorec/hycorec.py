@@ -15,6 +15,7 @@ References:
 """
 
 import json
+import inspect
 import math
 import os.path
 import random
@@ -61,7 +62,75 @@ def _scatter_mean(values: torch.Tensor, index: torch.Tensor, dim_size: int) -> t
     # 返回按 group 聚合后的均值。
     return out / count.view(*view_shape)
 
+def check(name, x, log_file="debug.log"):
+    if not isinstance(x, torch.Tensor):
+        all_finite = "non-tensor"
+        min_val = "non-tensor"
+        max_val = "non-tensor"
+    else:
+        finite_mask = torch.isfinite(x)
+        all_finite = finite_mask.all().item()
+        any_finite = finite_mask.any().item()
 
+        if any_finite:
+            finite_vals = x[finite_mask]
+            min_val = finite_vals.min().item()
+            max_val = finite_vals.max().item()
+        else:
+            min_val = "nan"
+            max_val = "nan"
+
+    log_path = os.path.join(os.path.dirname(__file__), log_file) if "__file__" in globals() else log_file
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{name} {all_finite} {min_val} {max_val}\n")
+
+
+def _numeric_debug_location():
+    frame = inspect.currentframe()
+    if frame is None or frame.f_back is None or frame.f_back.f_back is None:
+        return 'unknown'
+    caller = frame.f_back.f_back
+    return f'{os.path.basename(caller.f_code.co_filename)}:{caller.f_lineno}'
+
+
+def _numeric_debug_tensor(owner, name, tensor):
+    if not getattr(owner, 'nan_debug', False):
+        return True
+    if not isinstance(tensor, torch.Tensor):
+        return True
+    if not (tensor.is_floating_point() or tensor.is_complex()):
+        return True
+    if torch.isfinite(tensor).all().item():
+        return True
+
+    with torch.no_grad():
+        detached = tensor.detach()
+        finite_mask = torch.isfinite(detached)
+        finite_count = int(finite_mask.sum().item())
+        total = detached.numel()
+        stats = {
+            'shape': tuple(detached.shape),
+            'dtype': str(detached.dtype),
+            'device': str(detached.device),
+            'finite': f'{finite_count}/{total}',
+            'nan': int(torch.isnan(detached).sum().item()) if detached.is_floating_point() else 0,
+            '+inf': int(torch.isposinf(detached).sum().item()) if detached.is_floating_point() else 0,
+            '-inf': int(torch.isneginf(detached).sum().item()) if detached.is_floating_point() else 0,
+        }
+        if finite_count > 0:
+            finite_vals = detached[finite_mask].float()
+            stats.update({
+                'min': float(finite_vals.min().item()),
+                'max': float(finite_vals.max().item()),
+                'mean': float(finite_vals.mean().item()),
+            })
+
+    message = f"[NUMERIC DEBUG] non-finite tensor '{name}' at {_numeric_debug_location()} stats={stats}"
+    logger.error(message)
+    if getattr(owner, 'nan_debug_raise', True):
+        raise FloatingPointError(message)
+    return False
 class HyCoRecModel(BaseModel):
     """
 
@@ -433,41 +502,28 @@ class HyCoRecModel(BaseModel):
 
         return embedding
     
-    def encode_user_repr(self, related_items, related_entities, related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding,
-                          item_hyperedge_weight=None, entity_hyperedge_weight=None, word_hyperedge_weight=None):
-        """
-        编码用户表示，支持可选的超边权重。
-        
-        仿照 CACHE/models.py 中 SetGNN.forward() 的 edge_weight 机制：
-        - 外部传入的 hyperedge_weight 是每条超边的权重 (0~1)，形状为 (num_hyperedges,)
-        - 权重会传递给 HypergraphConv，影响消息传播
-        
-        Args:
-            item_hyperedge_weight: (num_item_hyperedges,) item超图的超边权重，可选
-            entity_hyperedge_weight: (num_entity_hyperedges,) entity超图的超边权重，可选
-            word_hyperedge_weight: (num_word_hyperedges,) word超图的超边权重，可选
-        """
+    def encode_user_repr(self, related_items, related_entities, related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding,):
         # 获取超图后的数据
         item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
         if len(related_items) > 0:
             items, item_hyper_edge_index = self._get_hypergraph(related_items, self.item_adj)
             sub_item_embedding, sub_item_edge_index, item_tot2sub = self._before_hyperconv(tot_item_embedding, items, item_hyper_edge_index, self.item_adj)
             # 传入 hyperedge_weight 进行有权重的消息传播
-            raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index, hyperedge_weight=item_hyperedge_weight)
+            raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index)
             item_embedding = raw_item_embedding
 
         entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
         if len(related_entities) > 0:
             entities, entity_hyper_edge_index = self._get_hypergraph(related_entities, self.entity_adj)
             sub_entity_embedding, sub_entity_edge_index, entity_tot2sub = self._before_hyperconv(tot_entity_embedding, entities, entity_hyper_edge_index, self.entity_adj)
-            raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index, hyperedge_weight=entity_hyperedge_weight)
+            raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index)
             entity_embedding = raw_entity_embedding
             
         word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
         if len(related_words) > 0:
             words, word_hyper_edge_index = self._get_hypergraph(related_words, self.word_adj)
             sub_word_embedding, sub_word_edge_index, word_tot2sub = self._before_hyperconv(tot_word_embedding, words, word_hyper_edge_index, self.word_adj)
-            raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index, hyperedge_weight=word_hyperedge_weight)
+            raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index)
             word_embedding = raw_word_embedding
 
         # 注意力机制
@@ -494,32 +550,12 @@ class HyCoRecModel(BaseModel):
         return res_data
 
     # 获取用户编码
-    def encode_user(self, batch_related_items, batch_related_entities, batch_related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding,
-                    batch_item_weights=None, batch_entity_weights=None, batch_word_weights=None):
-        """
-        批量获取用户编码，支持可选的超边权重。
-        
-        Args:
-            batch_item_weights: list of Tensor 或 None，每个样本的 item 超边权重
-            batch_entity_weights: list of Tensor 或 None
-            batch_word_weights: list of Tensor 或 None
-        """
+    def encode_user(self, batch_related_items, batch_related_entities, batch_related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding):
         user_repr_list = []
-        batch_size = len(batch_related_items)
-        
-        for i, (related_items, related_entities, related_words) in enumerate(zip(batch_related_items, batch_related_entities, batch_related_words)):
-            # 获取当前样本的权重（如果有的话）
-            item_w = batch_item_weights[i] if batch_item_weights is not None else None
-            entity_w = batch_entity_weights[i] if batch_entity_weights is not None else None
-            word_w = batch_word_weights[i] if batch_word_weights is not None else None
-            
+        for (related_items, related_entities, related_words) in zip(batch_related_items, batch_related_entities, batch_related_words):
             user_repr = self.encode_user_repr(
                 related_items, related_entities, related_words, 
-                tot_item_embedding, tot_entity_embedding, tot_word_embedding,
-                item_hyperedge_weight=item_w,
-                entity_hyperedge_weight=entity_w,
-                word_hyperedge_weight=word_w
-            )
+                tot_item_embedding, tot_entity_embedding, tot_word_embedding)
             user_repr_list.append(user_repr)
         user_embedding = torch.stack(user_repr_list, dim=0)
         return user_embedding
@@ -554,11 +590,14 @@ class HyCoRecModel(BaseModel):
         return loss, scores
     def _encode_kg_embeddings(self):
         # 对三类节点分别做一次 RGCN 编码，得到整图级节点表示。
-        return {
+        kg_embeddings = {
             'item': self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type),
             'entity': self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type),
             'word': self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
         }
+        for graph_key, embedding in kg_embeddings.items():
+            _numeric_debug_tensor(self, f'_encode_kg_embeddings.{graph_key}', embedding)
+        return kg_embeddings
 
     def _prepare_single_hypergraph(self, related_nodes, total_embedding, adj):
         # 当前样本没有该类型节点时，不构图，直接返回 None。
@@ -571,6 +610,7 @@ class HyCoRecModel(BaseModel):
         sub_node_embedding, sub_edge_index, _ = self._before_hyperconv(
             total_embedding, hypergraph_nodes, hyper_edge_index, adj
         )
+        _numeric_debug_tensor(self, '_prepare_single_hypergraph.sub_node_embedding', sub_node_embedding)
 
         # 预先记录超边数量，避免后面重复从索引里计算。
         num_hyperedges = 0
@@ -619,11 +659,15 @@ class HyCoRecModel(BaseModel):
         if graph_data is None:
             return torch.zeros((1, self.kg_emb_dim), device=self.device)
         # 否则对当前样本子图执行一次 HGCN，可选传入超边权重。
-        return hyper_conv(
+        _numeric_debug_tensor(self, '_run_hypergraph_conv.node_embedding_input', graph_data['node_embedding'])
+        _numeric_debug_tensor(self, '_run_hypergraph_conv.hyperedge_weight_input', hyperedge_weight)
+        out = hyper_conv(
             graph_data['node_embedding'],
             graph_data['hyper_edge_index'],
             hyperedge_weight=hyperedge_weight
         )
+        _numeric_debug_tensor(self, '_run_hypergraph_conv.output', out)
+        return out
 
     def encode_user_from_prepared_batch(self, prepared_batch, batch_item_weights=None,
                                         batch_entity_weights=None, batch_word_weights=None):
@@ -635,12 +679,20 @@ class HyCoRecModel(BaseModel):
             item_weight = batch_item_weights[idx] if batch_item_weights is not None else None
             entity_weight = batch_entity_weights[idx] if batch_entity_weights is not None else None
             word_weight = batch_word_weights[idx] if batch_word_weights is not None else None
-
+            # check("item_weight", item_weight)
+            # check("entity_weight", entity_weight)
+            # check("word_weight", word_weight)
             # item/entity/word 三类子图各自执行带权或不带权的 HGCN。
             item_embedding = self._run_hypergraph_conv(sample_graph['item'], self.hyper_conv_item, item_weight)
             entity_embedding = self._run_hypergraph_conv(sample_graph['entity'], self.hyper_conv_entity, entity_weight)
             word_embedding = self._run_hypergraph_conv(sample_graph['word'], self.hyper_conv_word, word_weight)
-
+            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].item_embedding', item_embedding)
+            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].entity_embedding', entity_embedding)
+            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].word_embedding', word_embedding)
+            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].context_embedding', sample_graph['context_embedding'])
+            # check("item_embd", item_embedding)
+            # check("entity_embd", entity_embedding)
+            # check("word_embd", word_embedding)
             # 将三路子图表示和上下文表示融合成单个用户向量。
             user_repr = self._attention_and_gating(
                 item_embedding,
@@ -648,11 +700,14 @@ class HyCoRecModel(BaseModel):
                 word_embedding,
                 sample_graph['context_embedding']
             )
+            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].user_repr', user_repr)
             # 收集 batch 内所有样本的用户表示。
             user_repr_list.append(user_repr)
 
         # 堆叠成标准 batch 形状。
-        return torch.stack(user_repr_list, dim=0)
+        user_embedding = torch.stack(user_repr_list, dim=0)
+        _numeric_debug_tensor(self, 'encode_user_from_prepared_batch.user_embedding', user_embedding)
+        return user_embedding
 
     def recommend_from_prepared_batch(self, prepared_batch, batch_item_weights=None,
                                       batch_entity_weights=None, batch_word_weights=None):
@@ -663,11 +718,16 @@ class HyCoRecModel(BaseModel):
             batch_entity_weights=batch_entity_weights,
             batch_word_weights=batch_word_weights
         )
+        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.user_embedding', user_embedding)
         # 推荐打分始终与 entity 编码后的整图实体向量做线性匹配。
         entity_embedding = prepared_batch['kg_embeddings']['entity']
+        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.entity_embedding', entity_embedding)
+        # check("user_embd", user_embedding)
         scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)
+        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.scores', scores)
         # 交叉熵损失仍使用原始 item 标签监督。
         loss = self.rec_loss(scores, prepared_batch['item'])
+        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.loss', loss)
         return loss, scores, prepared_batch['item']
 
     def build_batch_hyperedge_weights(self, prepared_batch, item_weight_fn=None,
@@ -1067,9 +1127,15 @@ class ViewLearner(nn.Module):
 
     def forward(self, node_features, hyper_edge_index):
         # 先用独立 HypergraphConv 对输入节点特征做一次编码。
+        _numeric_debug_tensor(self, 'ViewLearner.forward.node_features_input', node_features)
+        check("node_features", node_features,"view learner forward")
         encoded_node_feat = self.encoder(node_features, hyper_edge_index)
+        _numeric_debug_tensor(self, 'ViewLearner.forward.encoded_node_feat', encoded_node_feat)
+        check("encoded_node_feat", encoded_node_feat,"view learner forward")
         # 再按配置的聚合方式生成每条超边的表示。
         hedge_embedding = self._aggregate_hyperedge_embedding(encoded_node_feat, hyper_edge_index)
+        _numeric_debug_tensor(self, 'ViewLearner.forward.hedge_embedding', hedge_embedding)
+        check("hedge_embedding", hedge_embedding,"view learner forward")
 
         # 重新取出连接级的节点索引与超边索引。
         node_ids = hyper_edge_index[0]
@@ -1079,5 +1145,8 @@ class ViewLearner(nn.Module):
             [encoded_node_feat[node_ids], hedge_embedding[hedge_ids]],
             dim=1
         )
+        _numeric_debug_tensor(self, 'ViewLearner.forward.total_emb', total_emb)
         # 通过 MLP 输出每条连接的权重 logits，并展平成一维。
-        return self.mlp_edge_model(total_emb).reshape(-1)
+        logits = self.mlp_edge_model(total_emb).reshape(-1)
+        _numeric_debug_tensor(self, 'ViewLearner.forward.logits', logits)
+        return logits
