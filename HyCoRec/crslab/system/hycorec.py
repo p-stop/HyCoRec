@@ -31,13 +31,16 @@ def _dump_debug_tensors(scores_orig_norm, scores_f, scores_cf):
     torch.save(scores_f.detach().cpu(),        os.path.join(dump_dir, "scores_f"))
     torch.save(scores_cf.detach().cpu(),       os.path.join(dump_dir, "scores_cf"))
 
-def gumbel_softmax(logits, temperature=1.0):
+def gumbel_softmax(logits, temperature=1.0, clip_eps=0.0):
     """Gumbel-Softmax trick for differentiable sampling"""
     bias = 0.0001
     eps = (bias - (1 - bias)) * torch.rand(logits.size(), device=logits.device) + (1 - bias)
     gate_inputs = torch.log(eps) - torch.log(1 - eps)
     gate_inputs = (gate_inputs + logits) / temperature
-    return torch.sigmoid(gate_inputs).reshape(-1)
+    probs = torch.sigmoid(gate_inputs).reshape(-1)
+    if clip_eps > 0:
+        probs = probs.clamp(min=clip_eps, max=1.0 - clip_eps)
+    return probs
 
 def check(name, x, log_file="debug.log"):
     if not isinstance(x, torch.Tensor):
@@ -93,6 +96,8 @@ class HyCoRecSystem(BaseSystem):
         
         # ViewLearner 超参数（从配置中读取，设置默认值）
         # 仿照 CACHE/train.py 的参数设置
+        self.f_mode = self.view_optim_opt.get('f_mode', 2)  # factual loss 版本选择
+        self.cf_mode = self.view_optim_opt.get('cf_mode', 3)  # counterfactual loss 版本选择
         self.kg_emb_dim = opt.get('kg_emb_dim', 128)
         self.view_hidden_dim = self.view_optim_opt.get('view_hidden_dim', 64)  # ViewLearner 隐藏层维度
         self.view_hyperedge_aggregation = self.view_optim_opt.get('hyperedge_aggregation', 'mean')
@@ -109,6 +114,13 @@ class HyCoRecSystem(BaseSystem):
         self.loss_tau = self.view_optim_opt.get('loss_tau', self.view_optim_opt.get('tau', 1.0))  # KL 蒸馏温度
         self.loss_topk = self.view_optim_opt.get('loss_topk', self.view_optim_opt.get('topk', 50))  # 排名损失使用的 top-k
         self.loss_neg_k = self.view_optim_opt.get('loss_neg_k', self.view_optim_opt.get('neg_k', 50))  # top-k 对比负样本数
+        self.weight_clip_eps = float(self.view_optim_opt.get('weight_clip_eps', 1e-4))
+        self.degree_clip_eps = float(self.view_optim_opt.get('degree_clip_eps', 0.0))
+        self.nan_dump_dir = self.view_optim_opt.get('nan_dump_dir', './debug_dumps/view_nan')
+        if not (0.0 <= self.weight_clip_eps < 0.5):
+            raise ValueError(f'view.weight_clip_eps must be in [0, 0.5), got {self.weight_clip_eps}')
+        if self.degree_clip_eps < 0:
+            raise ValueError(f'view.degree_clip_eps must be >= 0, got {self.degree_clip_eps}')
 
 
         self.nan_debug = self.view_optim_opt.get('debug_nan', True)
@@ -183,6 +195,98 @@ class HyCoRecSystem(BaseSystem):
         for module in modules:
             module.nan_debug = self.nan_debug
             module.nan_debug_raise = self.nan_debug_raise
+            object.__setattr__(module, 'degree_clip_eps', self.degree_clip_eps)
+
+    def _clip_hyperedge_weight(self, weight, name='hyperedge_weight'):
+        if weight is None or self.weight_clip_eps <= 0:
+            return weight
+        clipped = weight.clamp(min=self.weight_clip_eps, max=1.0 - self.weight_clip_eps)
+        if self.nan_debug:
+            raw_low = int((weight < self.weight_clip_eps).sum().item())
+            raw_high = int((weight > (1.0 - self.weight_clip_eps)).sum().item())
+            if raw_low > 0 or raw_high > 0:
+                logger.warning(
+                    f"[WEIGHT CLIP] {name} eps={self.weight_clip_eps} "
+                    f"raw_low={raw_low} raw_high={raw_high} "
+                    f"context={getattr(self, '_debug_context', {})}"
+                )
+        return clipped
+
+    def _debug_monitor_degree_health(self, name, prepared_batch, batch_weights):
+        if not self.nan_debug:
+            return
+        degree_zero_eps = max(self.weight_clip_eps * 0.5, 1e-12)
+        for sample_idx, sample_graph in enumerate(prepared_batch['graphs']):
+            for graph_key in ('item', 'entity', 'word'):
+                weight_list = batch_weights.get(graph_key, None)
+                if weight_list is None or sample_idx >= len(weight_list):
+                    continue
+                weight = weight_list[sample_idx]
+                graph_data = sample_graph[graph_key]
+                if weight is None or graph_data is None:
+                    continue
+                hyper_edge_index = graph_data['hyper_edge_index']
+                if hyper_edge_index.numel() == 0:
+                    continue
+
+                node_ids = hyper_edge_index[0]
+                hedge_ids = hyper_edge_index[1]
+                node_degree = weight.new_zeros(graph_data['node_embedding'].size(0))
+                node_degree.index_add_(0, node_ids, weight[hedge_ids])
+
+                if node_degree.numel() == 0:
+                    continue
+                min_weight = float(weight.min().item())
+                max_weight = float(weight.max().item())
+                min_degree = float(node_degree.min().item())
+                zero_degree_count = int((node_degree <= degree_zero_eps).sum().item())
+                non_finite_degree = int((~torch.isfinite(node_degree)).sum().item())
+
+                if zero_degree_count > 0 or non_finite_degree > 0:
+                    logger.error(
+                        f"[DEGREE DEBUG] {name}.{graph_key}[{sample_idx}] "
+                        f"min_weight={min_weight:.6e} max_weight={max_weight:.6e} "
+                        f"min_degree={min_degree:.6e} zero_degree_nodes={zero_degree_count}/{node_degree.numel()} "
+                        f"non_finite_degree={non_finite_degree} "
+                        f"context={getattr(self, '_debug_context', {})}"
+                    )
+
+    def _dump_view_backward_snapshot(self, reason, scores_orig, scores_f, scores_cf,
+                                     loss_f, loss_cf, aug_weight_mean, view_loss,
+                                     batch_weights_f, batch_weights_cf):
+        if not self.nan_debug:
+            return
+
+        os.makedirs(self.nan_dump_dir, exist_ok=True)
+        debug_ctx = getattr(self, '_debug_context', {})
+        epoch = debug_ctx.get('epoch', 'na')
+        batch_idx = debug_ctx.get('batch_idx', 'na')
+        dump_name = f'view_backward_nan_e{epoch}_b{batch_idx}.pt'
+        dump_path = os.path.join(self.nan_dump_dir, dump_name)
+
+        payload = {
+            'reason': str(reason),
+            'context': debug_ctx,
+            'weight_clip_eps': self.weight_clip_eps,
+            'degree_clip_eps': self.degree_clip_eps,
+            'view_alpha': self.view_alpha,
+            'view_lambda': self.view_lambda,
+            'loss_f': loss_f.detach().cpu(),
+            'loss_cf': loss_cf.detach().cpu(),
+            'aug_weight_mean': aug_weight_mean.detach().cpu(),
+            'view_loss': view_loss.detach().cpu(),
+            'scores_orig': scores_orig.detach().cpu(),
+            'scores_f': scores_f.detach().cpu(),
+            'scores_cf': scores_cf.detach().cpu(),
+        }
+        for graph_key in ('item', 'entity', 'word'):
+            factual = [w.detach().cpu() for w in batch_weights_f[graph_key] if w is not None]
+            counterfactual = [w.detach().cpu() for w in batch_weights_cf[graph_key] if w is not None]
+            payload[f'batch_weights_f.{graph_key}'] = factual
+            payload[f'batch_weights_cf.{graph_key}'] = counterfactual
+
+        torch.save(payload, dump_path)
+        logger.error(f'[VIEW BACKWARD SNAPSHOT] saved to {dump_path}')
 
     def _debug_check_weight_lists(self, name, batch_weights):
         if not self.nan_debug:
@@ -252,10 +356,9 @@ class HyCoRecSystem(BaseSystem):
                 )
                 # check(f"{graph_key}_weight_logits", weight_logits)
                 # 用 gumbel-softmax 将 logits 变成可微的连接保留概率。
-                connection_weight = gumbel_softmax(weight_logits, self.temperature)
-                c_w = torch.sigmoid(weight_logits)
+                connection_weight = gumbel_softmax(weight_logits, self.temperature,self.weight_clip_eps)
+                # c_w = torch.sigmoid(weight_logits)
                 # check(f"{graph_key}_connection_weight", connection_weight)
-                # check(f"{graph_key}_connection_weight_sigmoid", c_w)
                 # 保存当前样本当前图类型的超边权重，稍后直接喂给 HGCN。
                 batch_weights[graph_key].append(connection_weight)
                 # 同时把它展平收集起来，用于正则项统计。
@@ -578,6 +681,8 @@ class HyCoRecSystem(BaseSystem):
         # factual 的补权重对应 counterfactual 视图。
         batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
         self._debug_check_weight_lists('train_view_learner_step.batch_weights_cf', batch_weights_cf)
+        self._debug_monitor_degree_health('train_view_learner_step.batch_weights_f', prepared_batch, batch_weights_f)
+        self._debug_monitor_degree_health('train_view_learner_step.batch_weights_cf', prepared_batch, batch_weights_cf)
         # 将反事实权重送入 HGCN，得到 counterfactual 分数。
         _, scores_cf ,_= core_model.recommend_from_prepared_batch(
             prepared_batch,
@@ -633,8 +738,32 @@ class HyCoRecSystem(BaseSystem):
         # 先清空 ViewLearner 梯度。
         self.view_optimizer.zero_grad()
         # 只对 ViewLearner 相关参数反向传播。
-        with self._debug_anomaly_context():
-            view_loss.backward()
+        try:
+            with self._debug_anomaly_context():
+                view_loss.backward()
+            self.evaluator.optim_metrics.add("view_backward_nan", AverageMetric(0.0))
+        except RuntimeError as error:
+            logger.error(
+                f"[VIEW BACKWARD FAILED] {error}; "
+                f"context={getattr(self, '_debug_context', {})}"
+            )
+            self._dump_view_backward_snapshot(
+                error,
+                scores_orig,
+                scores_f,
+                scores_cf,
+                loss_f,
+                loss_cf,
+                aug_weight_mean,
+                view_loss,
+                batch_weights_f,
+                batch_weights_cf
+            )
+            self.evaluator.optim_metrics.add("view_backward_nan", AverageMetric(1.0))
+            self._set_requires_grad(self.model, True)
+            if self.nan_debug_raise:
+                raise
+            return
         self._debug_check_module_grads('train_view_learner_step.after_backward', self._view_learners())
         # 做梯度裁剪，避免权重学习过程不稳定。
         view_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -798,48 +927,51 @@ class HyCoRecSystem(BaseSystem):
         """
         事实损失：宏观上保证 factual 分布与原始分布一致。
         """
-        # # 版本 1（当前启用）：KL(softmax(z_orig / tau) || softmax(z_f / tau))
-        # tau = max(float(self.loss_tau), 1e-8)
-        # teacher_prob = F.softmax(scores_orig / tau, dim=-1)
-        # factual_log_prob = F.log_softmax(scores_f / tau, dim=-1)
-        # return F.kl_div(factual_log_prob, teacher_prob, reduction='batchmean')
+        if self.f_mode == 1:
+        # 版本 1（当前启用）：KL(softmax(z_orig / tau) || softmax(z_f / tau))
+            tau = max(float(self.loss_tau), 1e-8)
+            teacher_prob = F.softmax(scores_orig / tau, dim=-1)
+            factual_log_prob = F.log_softmax(scores_f / tau, dim=-1)
+            return F.kl_div(factual_log_prob, teacher_prob, reduction='batchmean')
 
         # 版本 2（备用，已注释）：topk 仍是 topk
         # 特判
-        B, N = scores_f.shape
-        tk = min(max(int(self.loss_topk), 1), N - 1)
-        neg_k = min(max(int(self.loss_neg_k), 1), N - tk)
-        
-        pos_idx, pos_w = self._get_teacher_topk(scores_orig, tk)
-        pos_scores = scores_f.gather(1, pos_idx)
-        
-        mask = torch.zeros_like(scores_f, dtype=torch.bool)
-        mask.scatter_(1, pos_idx, True)
-        
-        neg_pool = scores_f.masked_fill(mask, -1e9)
-        neg_scores = torch.topk(neg_pool, neg_k, dim=1).values
-        
-        pair_loss = F.softplus(
-            self.gamma - pos_scores.unsqueeze(-1) + neg_scores.unsqueeze(1)
-        )
-        return pair_loss.mean()
+        elif self.f_mode == 2:
+            B, N = scores_f.shape
+            tk = min(max(int(self.loss_topk), 1), N - 1)
+            neg_k = min(max(int(self.loss_neg_k), 1), N - tk)
+            
+            pos_idx, pos_w = self._get_teacher_topk(scores_orig, tk)
+            pos_scores = scores_f.gather(1, pos_idx)
+            
+            mask = torch.zeros_like(scores_f, dtype=torch.bool)
+            mask.scatter_(1, pos_idx, True)
+            
+            neg_pool = scores_f.masked_fill(mask, -1e9)
+            neg_scores = torch.topk(neg_pool, neg_k, dim=1).values
+            
+            pair_loss = F.softplus(
+                self.gamma - pos_scores.unsqueeze(-1) + neg_scores.unsqueeze(1)
+            )
+            return (pair_loss * pos_w.unsqueeze(-1)).mean()
 
         # 版本 3（备用，已注释）：topk > bottomk
-        # B, N = scores_f.shape
-        # if N <= 1:
-        #     return scores_f.sum() * 0.0
-        
-        # tk = min(max(int(self.loss_topk), 1), N // 2)
-        # top_idx = torch.topk(scores_orig.detach(), tk, dim=1).indices
-        # bottom_idx = torch.topk(scores_orig.detach(), tk, dim=1, largest=False).indices
-        
-        # top_scores = scores_f.gather(1, top_idx)
-        # bottom_scores = scores_f.gather(1, bottom_idx)
-        # pair_loss = torch.clamp(
-        #     self.gamma - top_scores.unsqueeze(-1) + bottom_scores.unsqueeze(1),
-        #     min=0
-        # )
-        # return pair_loss.mean()
+        else:
+            B, N = scores_f.shape
+            if N <= 1:
+                return scores_f.sum() * 0.0
+            
+            tk = min(max(int(self.loss_topk), 1), N // 2)
+            top_idx = torch.topk(scores_orig.detach(), tk, dim=1).indices
+            bottom_idx = torch.topk(scores_orig.detach(), tk, dim=1, largest=False).indices
+            
+            top_scores = scores_f.gather(1, top_idx)
+            bottom_scores = scores_f.gather(1, bottom_idx)
+            pair_loss = torch.clamp(
+                self.gamma - top_scores.unsqueeze(-1) + bottom_scores.unsqueeze(1),
+                min=0
+            )
+            return pair_loss.mean()
 
     def counterfactual_loss(self, scores_orig, scores_cf):
         """
@@ -849,55 +981,58 @@ class HyCoRecSystem(BaseSystem):
         """
         # # 版本 1（当前启用）：原 top1 被原 top(k+1) 反超
         # #特判
-        # B, N = scores_cf.shape
-        # if N <= 1:
-        #     return scores_cf.sum() * 0.0
-        # tk = min(max(int(self.loss_topk), 1), N - 1)
+        if self.cf_mode == 1:
+            B, N = scores_cf.shape
+            if N <= 1:
+                return scores_cf.sum() * 0.0
+            tk = min(max(int(self.loss_topk), 1), N - 1)
 
-        # ranked_idx = torch.topk(scores_orig, tk + 1, dim=1).indices
-        # top1_idx = ranked_idx[:, :1]
-        # challenger_idx = ranked_idx[:, tk:tk + 1]
+            ranked_idx = torch.topk(scores_orig, tk + 1, dim=1).indices
+            top1_idx = ranked_idx[:, :1]
+            challenger_idx = ranked_idx[:, tk:tk + 1]
 
-        # top1_score = scores_cf.gather(1, top1_idx)
-        # challenger_score = scores_cf.gather(1, challenger_idx)
-        # return F.softplus(self.gamma + top1_score - challenger_score).mean()
+            top1_score = scores_cf.gather(1, top1_idx)
+            challenger_score = scores_cf.gather(1, challenger_idx)
+            return F.softplus(self.gamma + top1_score - challenger_score).mean()
 
         # 版本 2（备用，已注释）：topk < bottomk
-        # B, N = scores_cf.shape
-        # if N <= 1:
-        #     return scores_cf.sum() * 0.0
-        
-        # tk = min(max(int(self.loss_topk), 1), N // 2)
-        # top_idx = torch.topk(scores_orig.detach(), tk, dim=1).indices
-        # bottom_idx = torch.topk(scores_orig.detach(), tk, dim=1, largest=False).indices
-        
-        # top_scores = scores_cf.gather(1, top_idx)
-        # bottom_scores = scores_cf.gather(1, bottom_idx)
-        # pair_loss = torch.clamp(
-        #     self.gamma + top_scores.unsqueeze(-1) - bottom_scores.unsqueeze(1),
-        #     min=0
-        # )
-        # return pair_loss.mean()
+        elif self.cf_mode == 2:
+            B, N = scores_cf.shape
+            if N <= 1:
+                return scores_cf.sum() * 0.0
+            
+            tk = min(max(int(self.loss_topk), 1), N // 2)
+            top_idx = torch.topk(scores_orig.detach(), tk, dim=1).indices
+            bottom_idx = torch.topk(scores_orig.detach(), tk, dim=1, largest=False).indices
+            
+            top_scores = scores_cf.gather(1, top_idx)
+            bottom_scores = scores_cf.gather(1, bottom_idx)
+            pair_loss = torch.clamp(
+                self.gamma + top_scores.unsqueeze(-1) - bottom_scores.unsqueeze(1),
+                min=0
+            )
+            return pair_loss.mean()
 
         # 版本 3（备用，已注释）：topk 不是 topk
         # 特判
-        B, N = scores_cf.shape
-        tk = min(max(int(self.loss_topk), 1), N - 1)
-        neg_k = min(max(int(self.loss_neg_k), 1), N - tk)
-        
-        pos_idx, pos_w = self._get_teacher_topk(scores_orig, tk)
-        pos_scores = scores_cf.gather(1, pos_idx)
-        
-        mask = torch.zeros_like(scores_cf, dtype=torch.bool)
-        mask.scatter_(1, pos_idx, True)
-        
-        neg_pool = scores_cf.masked_fill(mask, -1e9)
-        neg_scores = torch.topk(neg_pool, neg_k, dim=1).values
-        
-        pair_loss = F.softplus(
-            self.gamma + pos_scores.unsqueeze(-1) - neg_scores.unsqueeze(1)
-        )
-        return pair_loss.mean()
+        else:
+            B, N = scores_cf.shape
+            tk = min(max(int(self.loss_topk), 1), N - 1)
+            neg_k = min(max(int(self.loss_neg_k), 1), N - tk)
+            
+            pos_idx, pos_w = self._get_teacher_topk(scores_orig, tk)
+            pos_scores = scores_cf.gather(1, pos_idx)
+            
+            mask = torch.zeros_like(scores_cf, dtype=torch.bool)
+            mask.scatter_(1, pos_idx, True)
+            
+            neg_pool = scores_cf.masked_fill(mask, -1e9)
+            neg_scores = torch.topk(neg_pool, neg_k, dim=1).values
+            
+            pair_loss = F.softplus(
+                self.gamma + pos_scores.unsqueeze(-1) - neg_scores.unsqueeze(1)
+            )
+            return (pair_loss * pos_w.unsqueeze(-1)).mean()
     def _get_pretrain_model_filename(self):
         """Return the configured pretrain model filename."""
         if self.pretrain_model_name:
