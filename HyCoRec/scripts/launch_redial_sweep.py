@@ -25,7 +25,7 @@ def parse_args():
         '--gpus',
         type=int,
         nargs='*',
-        default=list(range(3,8)),
+        default=list(range(4,8)),
         help='GPU ids to use. Defaults to 0 1 2 3 4 5 6 7.',
     )
     parser.add_argument(

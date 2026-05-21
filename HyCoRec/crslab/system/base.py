@@ -83,8 +83,8 @@ class BaseSystem(ABC):
             self.test_dataloader = test_dataloader
         else:
             self.train_dataloader = train_dataloader
-            self.valid_dataloader = test_dataloader
-            self.test_dataloader =  valid_dataloader
+            self.valid_dataloader = valid_dataloader
+            self.test_dataloader =  test_dataloader
         self.vocab = vocab
         self.side_data = side_data
         # model

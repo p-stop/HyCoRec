@@ -113,7 +113,9 @@ class HyCoRecSystem(BaseSystem):
         self.tem_decay = self.view_optim_opt.get('tem_decay', False)  # 是否启用温度衰减（调试用）
         self.loss_tau = self.view_optim_opt.get('loss_tau', self.view_optim_opt.get('tau', 1.0))  # KL 蒸馏温度
         self.loss_topk = self.view_optim_opt.get('loss_topk', self.view_optim_opt.get('topk', 50))  # 排名损失使用的 top-k
+        logger.info(f"loss_topk: {self.loss_topk}")
         self.loss_neg_k = self.view_optim_opt.get('loss_neg_k', self.view_optim_opt.get('neg_k', 50))  # top-k 对比负样本数
+        logger.info(f"loss_neg_k: {self.loss_neg_k}")
         self.weight_clip_eps = float(self.view_optim_opt.get('weight_clip_eps', 1e-4))
         self.degree_clip_eps = float(self.view_optim_opt.get('degree_clip_eps', 0.0))
         self.nan_dump_dir = self.view_optim_opt.get('nan_dump_dir', './debug_dumps/view_nan')
@@ -579,7 +581,7 @@ class HyCoRecSystem(BaseSystem):
             self.log_wandb_metrics(train_report, stage='rec', mode='train', epoch=epoch)
             
             # val
-            logger.info('[Valid_lr]')
+            logger.info('[Valid]')
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
