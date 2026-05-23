@@ -82,6 +82,7 @@ class HyCoRecSystem(BaseSystem):
         self.ind2tok = vocab['ind2tok']
         self.end_token_idx = vocab['tok2ind']['__end__']
         self.item_ids = side_data['item_entity_ids']
+        self.out_conv = opt.get('out_conv', False)
 
         self.rec_optim_opt = opt['rec']
         self.conv_optim_opt = opt['conv']
@@ -407,15 +408,26 @@ class HyCoRecSystem(BaseSystem):
     def conv_evaluate(self, prediction, response, batch_user_id=None, batch_conv_id=None):
         prediction = prediction.tolist()
         response = response.tolist()
+        if self.out_conv:
+            out_count = 5
+        else:
+            out_count = 0
         if batch_user_id is None:
             for p, r in zip(prediction, response):
                 p_str = ind2txt(p, self.ind2tok, self.end_token_idx)
                 r_str = ind2txt(r, self.ind2tok, self.end_token_idx)
+                if out_count:
+                    logger.info(f"Prediction: {p_str}, Response: {r_str}")
+                    out_count-=1
                 self.evaluator.gen_evaluate(p_str, [r_str], p)
+
         else:
             for p, r, uid, cid in zip(prediction, response, batch_user_id, batch_conv_id):
                 p_str = ind2txt(p, self.ind2tok, self.end_token_idx)
                 r_str = ind2txt(r, self.ind2tok, self.end_token_idx)
+                if out_count:
+                    logger.info(f"Prediction: {p_str}, Response: {r_str}")
+                    out_count-=1
                 self.evaluator.gen_evaluate(p_str, [r_str], p)
 
     def step(self, batch, stage, mode):
