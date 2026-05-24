@@ -5,6 +5,12 @@
 
 import os
 import json
+import gc
+import shutil
+import subprocess
+import sys
+from argparse import Namespace
+from pathlib import Path
 from time import perf_counter
 import torch
 import torch.nn as nn
@@ -16,6 +22,7 @@ from crslab.evaluator.metrics.base import AverageMetric
 from crslab.evaluator.metrics.gen import PPLMetric
 from crslab.system.base import BaseSystem
 from crslab.system.utils.functions import ind2txt
+from crslab.model import get_model
 from crslab.model.crs.hycorec.hycorec import ViewLearner
 
 def _dump_debug_tensors(scores_orig_norm, scores_f, scores_cf):
@@ -87,13 +94,32 @@ class HyCoRecSystem(BaseSystem):
         self.rec_optim_opt = opt['rec']
         self.conv_optim_opt = opt['conv']
         self.view_optim_opt = opt['view']
+        self.sft_conv_opt = opt['sft_conv']
         self.rec_epoch = self.rec_optim_opt['epoch']
         self.conv_epoch = self.conv_optim_opt['epoch']
         self.rec_batch_size = self.rec_optim_opt['batch_size']
         self.conv_batch_size = self.conv_optim_opt['batch_size']
+        self.sft_epoch = self.sft_conv_opt.get('epoch', self.sft_conv_opt.get('num_train_epochs', self.conv_epoch))
+        self.sft_batch_size = self.sft_conv_opt.get('batch_size', self.conv_batch_size)
 
         self.rec_early_stop_metric = self.rec_optim_opt.get('early_stop_metric', 'rec_loss')
         self.bef_loss = 100000.0
+
+        self.use_sft_conv = opt.get('use_sft_conv', False)
+        self.sft_rec_topk = int(self.sft_conv_opt.get('test_rec_topk', 5))
+        self.sft_work_dir = self.sft_conv_opt.get('work_dir', './tmp/sft_conv')
+        self.sft_target_placeholder = self.sft_conv_opt.get('test_target_placeholder', '<TARGET_ITEMS>')
+        self.recommender_temp_dir = self.sft_conv_opt.get('rec_temp_dir', './tmp/recommender')
+        self.delete_rec_temp_after_conv = bool(self.sft_conv_opt.get('delete_rec_temp_after_conv', False))
+        self.release_rec_before_sft_train = bool(self.sft_conv_opt.get('release_rec_before_sft_train', True))
+        self.recommender_temp_model_file = os.path.join(
+            self.recommender_temp_dir,
+            self.sft_conv_opt.get(
+                'rec_temp_name',
+                f"{opt.get('model_name', 'hycorec')}_{opt.get('dataset', 'dataset')}_rec_temp.pth"
+            )
+        )
+        self.entity_id_to_item_token = self._build_entity_id_to_item_token()
         
         # ViewLearner 超参数（从配置中读取，设置默认值）
         # 仿照 CACHE/train.py 的参数设置
@@ -178,6 +204,151 @@ class HyCoRecSystem(BaseSystem):
     def _core_model(self):
         """Return the underlying model for both plain and DataParallel wrappers."""
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _token_ids_to_text(self, token_ids):
+        """Convert CRSLab token ids to a readable text string."""
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.detach().cpu().tolist()
+        return ind2txt(token_ids, self.ind2tok, self.end_token_idx)
+
+    def _extract_item_tokens(self, text):
+        """Extract item ids in ReDial-style @123 form, preserving order."""
+        item_tokens, seen = [], set()
+        for token in str(text or '').split():
+            if token.startswith('@') and token[1:].isdigit() and token not in seen:
+                item_tokens.append(token)
+                seen.add(token)
+        return item_tokens
+
+    def _build_entity_id_to_item_token(self):
+        """
+        Learn an entity-id -> @item_id map from processed conversation data.
+
+        The recommender scores entity ids, while the target-conditioned generator
+        should see ReDial-style @item_id tokens. Processed recommender turns keep
+        both the entity ids in ``items`` and the original @ids in response tokens,
+        so we pair them by mention order wherever possible.
+        """
+        mapping = {}
+        for dataloader in (self.train_dataloader, self.valid_dataloader, self.test_dataloader):
+            for conv_dict in getattr(dataloader, 'dataset', []):
+                if conv_dict.get('role') != 'Recommender':
+                    continue
+                item_entities = conv_dict.get('items', [])
+                response_text = self._token_ids_to_text(conv_dict.get('response', []))
+                item_tokens = self._extract_item_tokens(response_text)
+                for entity_id, item_token in zip(item_entities, item_tokens):
+                    mapping[int(entity_id)] = item_token
+        logger.info(f'[Build entity->item token map] {len(mapping)} entries')
+        return mapping
+
+    def _targets_from_response(self, response):
+        response_text = self._token_ids_to_text(response)
+        return self._extract_item_tokens(response_text)
+
+    def _targets_from_entities(self, entity_ids):
+        targets = []
+        for entity_id in entity_ids or []:
+            entity_id = int(entity_id)
+            targets.append(self.entity_id_to_item_token.get(entity_id, f'@{entity_id}'))
+        return targets
+
+    def _format_target_list(self, targets):
+        cleaned = [str(target) for target in targets if target]
+        return '; '.join(cleaned)
+
+    def _save_recommender_temp_model(self):
+        """Save recommender-related modules so the SFT stage can release GPU memory."""
+        os.makedirs(self.recommender_temp_dir, exist_ok=True)
+        state = {
+            'model_state_dict': self._core_model().state_dict(),
+            'view_learner_item_state_dict': self.view_learner_item.state_dict(),
+            'view_learner_entity_state_dict': self.view_learner_entity.state_dict(),
+            'view_learner_word_state_dict': self.view_learner_word.state_dict(),
+            'entity_id_to_item_token': self.entity_id_to_item_token,
+        }
+        torch.save(state, self.recommender_temp_model_file)
+        logger.info(f'[Temporary recommender saved to {self.recommender_temp_model_file}]')
+        return self.recommender_temp_model_file
+
+    def _load_recommender_temp_model(self):
+        """Restore recommender modules from the temporary checkpoint when needed."""
+        if hasattr(self, 'model') and self.model is not None:
+            return
+        if not os.path.exists(self.recommender_temp_model_file):
+            raise ValueError(f'Temporary recommender model [{self.recommender_temp_model_file}] does not exist')
+
+        self.model = get_model(self.opt, self.opt['model'], self.device, self.vocab, self.side_data).to(self.device)
+        self._restore_view_learners()
+        checkpoint = torch.load(self.recommender_temp_model_file, map_location=self.device)
+        self._core_model().load_state_dict(checkpoint['model_state_dict'])
+        self.view_learner_item.load_state_dict(checkpoint['view_learner_item_state_dict'])
+        self.view_learner_entity.load_state_dict(checkpoint['view_learner_entity_state_dict'])
+        self.view_learner_word.load_state_dict(checkpoint['view_learner_word_state_dict'])
+        self.entity_id_to_item_token.update(checkpoint.get('entity_id_to_item_token', {}))
+        self._configure_numeric_debug_modules()
+        logger.info(f'[Temporary recommender loaded from {self.recommender_temp_model_file}]')
+
+    def _restore_view_learners(self):
+        """Recreate ViewLearner modules after releasing them for SFT training."""
+        if hasattr(self, 'view_learner_item') and self.view_learner_item is not None:
+            return
+        if self.same_view:
+            self.view_learner_item = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+            self.view_learner_entity = self.view_learner_item
+            self.view_learner_word = self.view_learner_item
+        else:
+            self.view_learner_item = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+            self.view_learner_entity = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+            self.view_learner_word = ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            ).to(self.device)
+
+    def _release_recommender_from_memory(self):
+        """Drop recommender modules before loading the SFT language model."""
+        for attr in (
+            'optimizer',
+            'view_optimizer',
+            'model',
+            'view_learner_item',
+            'view_learner_entity',
+            'view_learner_word',
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info('[Temporary recommender released from memory]')
+
+    def _cleanup_recommender_temp_model(self):
+        if not self.delete_rec_temp_after_conv:
+            return
+        if os.path.isdir(self.recommender_temp_dir):
+            shutil.rmtree(self.recommender_temp_dir)
+            logger.info(f'[Temporary recommender directory removed: {self.recommender_temp_dir}]')
+        elif os.path.exists(self.recommender_temp_model_file):
+            os.remove(self.recommender_temp_model_file)
+            logger.info(f'[Temporary recommender file removed: {self.recommender_temp_model_file}]')
+
     def _set_requires_grad(self, module: nn.Module, requires_grad: bool) -> None:
         """Enable/disable gradients for all parameters in a module."""
         for p in module.parameters():
@@ -409,7 +580,7 @@ class HyCoRecSystem(BaseSystem):
         prediction = prediction.tolist()
         response = response.tolist()
         if self.out_conv:
-            out_count = 5
+            out_count = 2
         else:
             out_count = 0
         if batch_user_id is None:
@@ -644,6 +815,9 @@ class HyCoRecSystem(BaseSystem):
                 # self.step(batch, stage='rec', mode='test')
             test_report = self.evaluator.report(mode='test')
             self.log_wandb_metrics(test_report, stage='rec', mode='test')
+
+        if self.use_sft_conv:
+            self._save_recommender_temp_model()
 
     def train_view_learner_step(self, batch):
         """
@@ -884,7 +1058,384 @@ class HyCoRecSystem(BaseSystem):
         self.evaluator.optim_metrics.add("main_loss_f", AverageMetric(loss_f.item()))    
         self.evaluator.optim_metrics.add("main_loss_cf", AverageMetric(loss_cf.item()))
 
+    def _move_batch_tensors(self, batch):
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch[key] = value.to(self.device)
+        return batch
+
+    def _recommend_topk_item_tokens_for_conv_batch(self, batch, topk):
+        """Use the recommender to produce top-k @item ids for each conv sample."""
+        if not hasattr(self, 'model') or self.model is None:
+            self._load_recommender_temp_model()
+
+        self.model.eval()
+        for learner in self._view_learners().values():
+            learner.eval()
+
+        batch = self._move_batch_tensors(batch)
+        batch_size = len(batch['related_item'])
+        dummy_item = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        rec_batch = {
+            'conv_id': batch['conv_id'],
+            'related_item': batch['related_item'],
+            'related_entity': batch['related_entity'],
+            'related_word': batch['related_word'],
+            'item': dummy_item,
+        }
+
+        with torch.no_grad():
+            prepared_batch = self._prepare_recommendation_batch(rec_batch)
+            if self.use_counterfactual:
+                batch_weights_f, _ = self._build_batch_hyperedge_weights(prepared_batch)
+                _, scores, _ = self._core_model().recommend_from_prepared_batch(
+                    prepared_batch,
+                    batch_item_weights=batch_weights_f['item'],
+                    batch_entity_weights=batch_weights_f['entity'],
+                    batch_word_weights=batch_weights_f['word'],
+                )
+            else:
+                _, scores, _ = self._core_model().recommend_from_prepared_batch(prepared_batch)
+
+        item_scores = scores[:, self.item_ids]
+        k = min(max(int(topk), 1), item_scores.shape[-1])
+        _, topk_item_positions = torch.topk(item_scores, k, dim=-1)
+        topk_item_positions = topk_item_positions.detach().cpu().tolist()
+
+        batch_targets = []
+        for item_positions in topk_item_positions:
+            entity_ids = [int(self.item_ids[position]) for position in item_positions]
+            batch_targets.append(self._targets_from_entities(entity_ids))
+        return batch_targets
+
+    def _require_sft_dataloader(self, dataloader, split):
+        if not hasattr(dataloader, 'get_sft_records'):
+            raise TypeError(f'SFT conversation requires a dataloader with get_sft_records(); missing for {split}.')
+
+    def _sft_distributed_opt(self):
+        distributed = self.sft_conv_opt.get('distributed', {})
+        if isinstance(distributed, bool):
+            return {'enable': distributed}
+        return distributed or {}
+
+    def _sft_distributed_enabled(self):
+        return bool(self._sft_distributed_opt().get('enable', False))
+
+    def _sft_file_path(self, dataloader, split):
+        if hasattr(dataloader, 'get_sft_file_path'):
+            path = dataloader.get_sft_file_path(split)
+        else:
+            split_key = 'valid' if split == 'validation' else split
+            path = self.sft_conv_opt.get(f'{split_key}_file')
+        if not path:
+            raise ValueError(f'SFT {split} file is not configured.')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'SFT {split} file does not exist: {path}')
+        return path
+
+    def _append_sft_common_cli_args(self, cmd, train_file, valid_file, output_dir):
+        cmd.extend([
+            '--model_name_or_path', str(self.sft_conv_opt.get('model_name_or_path')),
+            '--train_file', str(train_file),
+            '--valid_file', str(valid_file),
+            '--output_dir', str(output_dir),
+            '--max_seq_length', str(int(self.sft_conv_opt.get('max_seq_length', 2048))),
+            '--learning_rate', str(float(self.sft_conv_opt.get('learning_rate', 2e-5))),
+            '--num_train_epochs', str(float(self.sft_conv_opt.get('num_train_epochs', self.sft_epoch))),
+            '--per_device_train_batch_size',
+            str(int(self.sft_conv_opt.get('per_device_train_batch_size', self.sft_batch_size))),
+            '--gradient_accumulation_steps', str(int(self.sft_conv_opt.get('gradient_accumulation_steps', 8))),
+            '--lora_r', str(int(self.sft_conv_opt.get('lora_r', 16))),
+            '--lora_alpha', str(int(self.sft_conv_opt.get('lora_alpha', 32))),
+            '--lora_dropout', str(float(self.sft_conv_opt.get('lora_dropout', 0.05))),
+            '--lora_target_modules', str(self.sft_conv_opt.get('lora_target_modules', 'q_proj,v_proj')),
+            '--ddp_find_unused_parameters',
+            str(bool(self.sft_conv_opt.get('ddp_find_unused_parameters', False))).lower(),
+            '--dataloader_num_workers', str(int(self.sft_conv_opt.get('dataloader_num_workers', 0))),
+            '--optim', str(self.sft_conv_opt.get('optim', 'adamw_torch')),
+        ])
+        if self.sft_conv_opt.get('deepspeed'):
+            cmd.extend(['--deepspeed', str(self.sft_conv_opt.get('deepspeed'))])
+        if bool(self.sft_conv_opt.get('gradient_checkpointing', True)):
+            cmd.append('--gradient_checkpointing')
+        if bool(self.sft_conv_opt.get('fp16', True)):
+            cmd.append('--fp16')
+        if bool(self.sft_conv_opt.get('bf16', False)):
+            cmd.append('--bf16')
+
+    def _run_sft_lora_training_distributed(self, train_dataloader, valid_dataloader, output_dir):
+        self._require_sft_dataloader(train_dataloader, 'train')
+        self._require_sft_dataloader(valid_dataloader, 'valid')
+        train_file = self._sft_file_path(train_dataloader, 'train')
+        valid_file = self._sft_file_path(valid_dataloader, 'valid')
+
+        distributed = self._sft_distributed_opt()
+        gpu_ids = distributed.get('gpu_ids', self.sft_conv_opt.get('distributed_gpus', '0,1,2,3'))
+        if isinstance(gpu_ids, (list, tuple)):
+            gpu_ids = ','.join(str(gpu_id) for gpu_id in gpu_ids)
+        gpu_ids = str(gpu_ids)
+        nproc = int(distributed.get('nproc_per_node', len([item for item in gpu_ids.split(',') if item.strip()])))
+
+        cmd = [
+            sys.executable,
+            '-m',
+            'torch.distributed.run',
+            '--standalone',
+            '--nnodes',
+            str(int(distributed.get('nnodes', 1))),
+            '--nproc_per_node',
+            str(nproc),
+            '-m',
+            'crslab.src.train_lora',
+        ]
+        self._append_sft_common_cli_args(cmd, train_file, valid_file, output_dir)
+
+        package_root = str(Path(__file__).resolve().parents[2])
+        env = os.environ.copy()
+        env['CUDA_VISIBLE_DEVICES'] = gpu_ids
+        env['TOKENIZERS_PARALLELISM'] = str(distributed.get('tokenizers_parallelism', 'false')).lower()
+        env['NCCL_ASYNC_ERROR_HANDLING'] = str(distributed.get('nccl_async_error_handling', '1'))
+        env['OMP_NUM_THREADS'] = str(distributed.get('omp_num_threads', 8))
+        env['PYTHONPATH'] = (
+            package_root
+            if not env.get('PYTHONPATH')
+            else package_root + os.pathsep + env['PYTHONPATH']
+        )
+
+        logger.info(f"[SFT_conv distributed] CUDA_VISIBLE_DEVICES={gpu_ids}, nproc_per_node={nproc}")
+        logger.info('[SFT_conv distributed] launching torchrun for LoRA SFT')
+        subprocess.run(cmd, cwd=os.getcwd(), env=env, check=True)
+        logger.info(f'[SFT_conv distributed model saved to {output_dir}]')
+        return output_dir
+
+    def _run_sft_lora_training(self, train_dataloader, valid_dataloader):
+        model_name_or_path = self.sft_conv_opt.get('model_name_or_path')
+        if not model_name_or_path:
+            logger.warning('[SFT_conv skipped] sft_conv.model_name_or_path is not configured.')
+            return None
+
+        output_dir = self.sft_conv_opt.get('output_dir', os.path.join(self.sft_work_dir, 'generator_lora'))
+        if self._sft_distributed_enabled():
+            return self._run_sft_lora_training_distributed(train_dataloader, valid_dataloader, output_dir)
+
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from trl import SFTTrainer
+            from crslab.src.train_lora import (
+                build_lora_config,
+                build_training_args,
+                filtered_kwargs,
+            )
+        except ImportError as exc:
+            logger.error(f'[SFT_conv unavailable] missing dependency: {exc}')
+            raise
+
+        self._require_sft_dataloader(train_dataloader, 'train')
+        self._require_sft_dataloader(valid_dataloader, 'valid')
+
+        args = Namespace(
+            model_name_or_path=model_name_or_path,
+            train_file=None,
+            valid_file=None,
+            output_dir=output_dir,
+            max_seq_length=int(self.sft_conv_opt.get('max_seq_length', 2048)),
+            learning_rate=float(self.sft_conv_opt.get('learning_rate', 2e-5)),
+            num_train_epochs=float(self.sft_conv_opt.get('num_train_epochs', self.sft_epoch)),
+            per_device_train_batch_size=int(self.sft_conv_opt.get('per_device_train_batch_size', self.sft_batch_size)),
+            gradient_accumulation_steps=int(self.sft_conv_opt.get('gradient_accumulation_steps', 8)),
+            gradient_checkpointing=bool(self.sft_conv_opt.get('gradient_checkpointing', True)),
+            fp16=bool(self.sft_conv_opt.get('fp16', True)),
+            bf16=bool(self.sft_conv_opt.get('bf16', False)),
+            ddp_find_unused_parameters=str(bool(self.sft_conv_opt.get('ddp_find_unused_parameters', False))).lower(),
+            dataloader_num_workers=int(self.sft_conv_opt.get('dataloader_num_workers', 0)),
+            optim=self.sft_conv_opt.get('optim', 'adamw_torch'),
+            deepspeed=self.sft_conv_opt.get('deepspeed', None),
+            lora_r=int(self.sft_conv_opt.get('lora_r', 16)),
+            lora_alpha=int(self.sft_conv_opt.get('lora_alpha', 32)),
+            lora_dropout=float(self.sft_conv_opt.get('lora_dropout', 0.05)),
+            lora_target_modules=self.sft_conv_opt.get('lora_target_modules', 'q_proj,v_proj'),
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        torch_dtype = torch.float16 if args.fp16 else torch.bfloat16 if args.bf16 else 'auto'
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+        )
+        model.config.use_cache = False
+        if args.gradient_checkpointing and hasattr(model, 'enable_input_require_grads'):
+            model.enable_input_require_grads()
+
+        train_dataset = train_dataloader.get_sft_text_dataset('train', tokenizer)
+        valid_dataset = valid_dataloader.get_sft_text_dataset('valid', tokenizer)
+        if len(train_dataset) == 0:
+            raise ValueError('[SFT_conv] train split is empty; build SFT data before training.')
+        if len(valid_dataset) == 0:
+            logger.warning('[SFT_conv] valid split is empty; using train split as eval dataset.')
+            valid_dataset = train_dataset
+
+        training_args, supports_assistant_only = build_training_args(args)
+        if not supports_assistant_only:
+            logger.warning('[SFT_conv] this TRL version does not expose assistant_only_loss; training full chat text.')
+
+        trainer_kwargs = {
+            'model': model,
+            'args': training_args,
+            'train_dataset': train_dataset,
+            'eval_dataset': valid_dataset,
+            'peft_config': build_lora_config(args),
+            'processing_class': tokenizer,
+            'tokenizer': tokenizer,
+            'dataset_text_field': 'text',
+            'max_seq_length': args.max_seq_length,
+        }
+        trainer = SFTTrainer(**filtered_kwargs(SFTTrainer.__init__, trainer_kwargs))
+        trainer.train()
+        trainer.save_model(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        logger.info(f'[SFT_conv model saved to {output_dir}]')
+
+        del trainer, model, tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return output_dir
+
+    def _predict_sft_test_targets(self, test_dataloader):
+        targets = []
+        for batch in test_dataloader.get_conv_data(
+            batch_size=self.conv_batch_size,
+            shuffle=False,
+            force_original=True,
+        ):
+            for item_tokens in self._recommend_topk_item_tokens_for_conv_batch(batch, self.sft_rec_topk):
+                targets.append(self._format_target_list(item_tokens))
+        return targets
+
+    def _build_recommender_conditioned_sft_test_records(self, test_dataloader):
+        records = test_dataloader.get_sft_records('test')
+        if not records:
+            return []
+
+        predicted_targets = self._predict_sft_test_targets(test_dataloader)
+        if len(predicted_targets) != len(records):
+            logger.warning(
+                f'[SFT_conv test] SFT test record count ({len(records)}) and recommender '
+                f'prediction count ({len(predicted_targets)}) differ; using aligned prefix.'
+            )
+
+        patched_records = []
+        for record, target_text in zip(records, predicted_targets):
+            if not target_text:
+                continue
+            if hasattr(test_dataloader, 'set_sft_record_target'):
+                patched_records.append(test_dataloader.set_sft_record_target(record, target_text))
+            else:
+                updated = json.loads(json.dumps(record, ensure_ascii=False))
+                updated.setdefault('meta', {})['target'] = target_text
+                patched_records.append(updated)
+        logger.info(f'[SFT_conv test] prepared {len(patched_records)} target-conditioned test records')
+        return patched_records
+
+    def _evaluate_sft_generator(self, records, adapter_path):
+        model_name_or_path = self.sft_conv_opt.get('model_name_or_path')
+        if not model_name_or_path or not adapter_path:
+            logger.warning('[SFT_conv test skipped] model_name_or_path or adapter_path is missing.')
+            return
+
+        try:
+            from crslab.src.hf_utils import format_messages_with_tokenizer
+            from crslab.src.infer_generator import (
+                build_generation_config,
+                generate_once,
+                load_generator,
+            )
+            from crslab.src.reason_builder import post_check_response
+        except ImportError as exc:
+            logger.error(f'[SFT_conv test unavailable] missing dependency: {exc}')
+            raise
+
+        max_test_samples = self.sft_conv_opt.get('max_test_samples')
+        if max_test_samples:
+            records = records[:int(max_test_samples)]
+        if not records:
+            logger.warning('[SFT_conv test skipped] no test records.')
+            return
+
+        generator, tokenizer = load_generator(model_name_or_path, adapter_path)
+        generation_config = build_generation_config(
+            tokenizer,
+            max_new_tokens=int(self.sft_conv_opt.get('max_new_tokens', 96)),
+            temperature=float(self.sft_conv_opt.get('temperature', 0.0)),
+        )
+
+        self.evaluator.reset_metrics()
+        target_mention_count = 0
+        safe_count = 0
+        for record in records:
+            prompt = format_messages_with_tokenizer(
+                record['messages'][:2],
+                tokenizer,
+                add_generation_prompt=True,
+            )
+            prediction = generate_once(generator, prompt, generation_config)
+            reference = record['messages'][2]['content']
+            self.evaluator.gen_evaluate(prediction, [reference], prediction.split())
+            checks = post_check_response(prediction, record['meta']['target'])
+            target_mention_count += int(checks['target_mentioned'])
+            safe_count += int(not checks['unsupported_claim_risk'])
+
+        total = len(records)
+        self.evaluator.optim_metrics.add('target_mention_rate', AverageMetric(target_mention_count / total))
+        self.evaluator.optim_metrics.add('weak_safety_rate', AverageMetric(safe_count / total))
+        test_report = self.evaluator.report(mode='test')
+        self.log_wandb_metrics(test_report, stage='conv', mode='test')
+
+        del generator, tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def SFT_conv(self, train_dataloader=None, valid_dataloader=None, test_dataloader=None,
+                 batch_size=None, epoch=None):
+        """
+        LoRA SFT conversation training integrated into HyCoRec's training flow.
+
+        SFT data is built offline. Train/valid read preprocessed records, while
+        test prompts are patched with the trained recommender's top-k movie ids.
+        """
+        if self.release_rec_before_sft_train:
+            if hasattr(self, 'model') and self.model is not None and not os.path.exists(self.recommender_temp_model_file):
+                self._save_recommender_temp_model()
+            self._release_recommender_from_memory()
+
+        adapter_path = self._run_sft_lora_training(train_dataloader, valid_dataloader)
+        if not adapter_path:
+            self._cleanup_recommender_temp_model()
+            return
+
+        if not hasattr(self, 'model') or self.model is None:
+            self._load_recommender_temp_model()
+        test_records = self._build_recommender_conditioned_sft_test_records(test_dataloader)
+        if self.release_rec_before_sft_train:
+            self._release_recommender_from_memory()
+        self._evaluate_sft_generator(test_records, adapter_path)
+        self._cleanup_recommender_temp_model()
+
     def train_conversation(self):
+        if self.use_sft_conv:
+            return self.SFT_conv(
+                self.train_dataloader,
+                self.valid_dataloader,
+                self.test_dataloader,
+                self.sft_batch_size,
+                self.sft_epoch,
+            )
+
         self._core_model().freeze_parameters()
         self.init_optim(self.conv_optim_opt, self.model.parameters())
 
