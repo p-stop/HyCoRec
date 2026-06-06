@@ -39,6 +39,7 @@ class StandardEvaluator(BaseEvaluator):
         self.rec_metrics = Metrics()
         # gen
         self.dist_set = defaultdict(set)
+        # self.dist_cnt = [0,0,0,0,0,0]
         self.dist_cnt = 0
         self.gen_metrics = Metrics()
         # optim
@@ -59,10 +60,13 @@ class StandardEvaluator(BaseEvaluator):
                 self.gen_metrics.add(f"bleu@{k}", BleuMetric.compute(hyp, refs, k))
                 for token in ngrams(seq, k):
                     self.dist_set[f"dist@{k}"].add(token)
+                    # self.dist_cnt[k] += 1
+            # self.dist_cnt[0] += 1
             self.dist_cnt += 1
 
     def report(self, epoch=-1, mode='test'):
-        for k, v in self.dist_set.items():
+        for i,( k, v ) in enumerate(self.dist_set.items()):
+            # self.gen_metrics.add(k, AverageMetric(len(v) / self.dist_cnt[i+1]))
             self.gen_metrics.add(k, AverageMetric(len(v) / self.dist_cnt))
         reports = [self.rec_metrics.report(), self.gen_metrics.report(), self.optim_metrics.report()]
         all_reports = aggregate_unnamed_reports(reports)
@@ -82,6 +86,7 @@ class StandardEvaluator(BaseEvaluator):
         self.rec_metrics.clear()
         # conv
         self.gen_metrics.clear()
+        # self.dist_cnt = [0,0,0,0,0,0]
         self.dist_cnt = 0
         self.dist_set.clear()
         # optim

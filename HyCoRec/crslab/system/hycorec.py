@@ -99,6 +99,10 @@ class HyCoRecSystem(BaseSystem):
         self.f_mode = self.view_optim_opt.get('f_mode', 2)  # factual loss 版本选择
         self.cf_mode = self.view_optim_opt.get('cf_mode', 3)  # counterfactual loss 版本选择
         self.kg_emb_dim = opt.get('kg_emb_dim', 128)
+        self.hgcn_layers = int(opt.get('hgcn_layers', 2))
+        if self.hgcn_layers < 1:
+            raise ValueError(f'hgcn_layers must be >= 1, got {self.hgcn_layers}')
+        self.hidden_dim = int(opt.get('hidden_dim', self.kg_emb_dim))
         self.view_hidden_dim = self.view_optim_opt.get('view_hidden_dim', 64)  # ViewLearner 隐藏层维度
         self.view_hyperedge_aggregation = self.view_optim_opt.get('hyperedge_aggregation', 'mean')
         self.view_lr = self.view_optim_opt.get('view_lr', 0.01)       # CACHE 默认 1e-2
@@ -125,9 +129,9 @@ class HyCoRecSystem(BaseSystem):
             raise ValueError(f'view.degree_clip_eps must be >= 0, got {self.degree_clip_eps}')
 
 
-        self.nan_debug = self.view_optim_opt.get('debug_nan', True)
-        self.nan_debug_raise = self.view_optim_opt.get('debug_nan_raise', True)
-        self.nan_debug_anomaly = self.view_optim_opt.get('debug_nan_anomaly', True)
+        self.nan_debug = self.view_optim_opt.get('debug_nan', False)
+        self.nan_debug_raise = self.view_optim_opt.get('debug_nan_raise', False)
+        self.nan_debug_anomaly = self.view_optim_opt.get('debug_nan_anomaly', False)
         if self.nan_debug:
             logger.warning(
                 '[NUMERIC DEBUG enabled] training will stop at the first NaN/Inf; '
@@ -142,36 +146,16 @@ class HyCoRecSystem(BaseSystem):
         self.pretrain_save_path = self.view_optim_opt.get('pretrain_save_path', './pretrain_models')
         self.pretrain_model_name = self.view_optim_opt.get('pretrain_model_name',None)
         
-        # 构建 ViewLearner（为三种超图各一个）
+        # 构建 ViewLearner（为三种超图各一组，与 HGCN 层一一对应）
         # 注意：ViewLearner 需要能直接处理节点特征和超边索引
         if(self.same_view):
-            self.view_learner_item = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
+            self.view_learner_item = self._build_view_learner_stack()
             self.view_learner_entity = self.view_learner_item  # 共享权重
             self.view_learner_word = self.view_learner_item    # 共享权
         else:
-            self.view_learner_item = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
-            self.view_learner_entity = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
-            self.view_learner_word = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
+            self.view_learner_item = self._build_view_learner_stack()
+            self.view_learner_entity = self._build_view_learner_stack()
+            self.view_learner_word = self._build_view_learner_stack()
         self._configure_numeric_debug_modules()
 
     def _core_model(self):
@@ -181,6 +165,38 @@ class HyCoRecSystem(BaseSystem):
         """Enable/disable gradients for all parameters in a module."""
         for p in module.parameters():
             p.requires_grad_(requires_grad)
+    def _build_view_learner_stack(self):
+        learners = []
+        for layer_idx in range(self.hgcn_layers):
+            input_dim = self.kg_emb_dim if layer_idx == 0 else self.hidden_dim
+            learners.append(
+                ViewLearner(
+                    input_dim,
+                    self.view_hidden_dim,
+                    self.device,
+                    hyperedge_aggregation=self.view_hyperedge_aggregation
+                )
+            )
+        return nn.ModuleList(learners).to(self.device)
+
+    @staticmethod
+    def _view_learner_layer(learner, layer_idx):
+        if isinstance(learner, (nn.ModuleList, list, tuple)):
+            return learner[layer_idx]
+        return learner if layer_idx == 0 else None
+
+    def _view_learner_parameters(self):
+        params = []
+        seen = set()
+        for learner in self._view_learners().values():
+            for param in learner.parameters():
+                param_id = id(param)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                params.append(param)
+        return params
+
     def _view_learners(self):###
         # 统一返回三类超图对应的 ViewLearner，便于后续循环处理。
         return {
@@ -234,7 +250,10 @@ class HyCoRecSystem(BaseSystem):
                 node_ids = hyper_edge_index[0]
                 hedge_ids = hyper_edge_index[1]
                 node_degree = weight.new_zeros(graph_data['node_embedding'].size(0))
-                node_degree.index_add_(0, node_ids, weight[hedge_ids])
+                if weight.numel() == hyper_edge_index.size(1):
+                    node_degree.index_add_(0, node_ids, weight)
+                else:
+                    node_degree.index_add_(0, node_ids, weight[hedge_ids])
 
                 if node_degree.numel() == 0:
                     continue
@@ -343,7 +362,7 @@ class HyCoRecSystem(BaseSystem):
         # 逐样本处理，因为每个样本的子图大小都可能不同。
         for sample_graph in prepared_batch['graphs']:
             # item/entity/word 三种超图共享同一套权重生成流程。
-            for graph_key, learner in self._view_learners().items():
+            for graph_key, learner_stack in self._view_learners().items():
                 # 取出当前样本在某一类图上的子图数据。
                 graph_data = sample_graph[graph_key]
                 # 如果该样本没有这一类图，就占位为 None。
@@ -351,7 +370,8 @@ class HyCoRecSystem(BaseSystem):
                     batch_weights[graph_key].append(None)
                     continue
 
-                # ViewLearner 先基于“节点特征 + 关联关系”输出连接级 logits。
+                # 第 0 层 ViewLearner 先基于“节点特征 + 关联关系”输出连接级 logits。
+                learner = self._view_learner_layer(learner_stack, 0)
                 weight_logits = learner(
                     graph_data['node_embedding'],
                     graph_data['hyper_edge_index']
@@ -467,7 +487,10 @@ class HyCoRecSystem(BaseSystem):
             prepared_batch,
             batch_item_weights=batch_weights_f['item'],
             batch_entity_weights=batch_weights_f['entity'],
-            batch_word_weights=batch_weights_f['word']
+            batch_word_weights=batch_weights_f['word'],
+            item_view_learner=self.view_learner_item,
+            entity_view_learner=self.view_learner_entity,
+            word_view_learner=self.view_learner_word
         )
 
         batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
@@ -476,7 +499,10 @@ class HyCoRecSystem(BaseSystem):
             prepared_batch,
             batch_item_weights=batch_weights_cf['item'],
             batch_entity_weights=batch_weights_cf['entity'],
-            batch_word_weights=batch_weights_cf['word']
+            batch_word_weights=batch_weights_cf['word'],
+            item_view_learner=self.view_learner_item,
+            entity_view_learner=self.view_learner_entity,
+            word_view_learner=self.view_learner_word
         )
 
         loss_f = self.factual_loss(scores_orig, scores_f)
@@ -501,11 +527,7 @@ class HyCoRecSystem(BaseSystem):
         self.init_optim(self.rec_optim_opt, self.model.parameters())
         
         # 初始化 ViewLearner 优化器
-        view_params = (
-            list(self.view_learner_item.parameters()) + 
-            list(self.view_learner_entity.parameters()) + 
-            list(self.view_learner_word.parameters())
-        )
+        view_params = self._view_learner_parameters()
         self.view_optimizer = torch.optim.Adam(view_params, lr=self.view_lr, weight_decay=self.view_wd)
 
  # ==================== 预训练阶段 ====================
@@ -585,8 +607,10 @@ class HyCoRecSystem(BaseSystem):
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                    self.rec_eval_with_weight(batch)
-                    # self.step(batch, stage='rec', mode='valid')
+                    if self.use_counterfactual:
+                        self.rec_eval_with_weight(batch)
+                    else:
+                        self.step(batch, stage='rec', mode='valid')
                 valid_report = self.evaluator.report(epoch=epoch, mode='valid')
                 self.log_wandb_metrics(valid_report, stage='rec', mode='valid', epoch=epoch)
                 # early stop
@@ -618,8 +642,10 @@ class HyCoRecSystem(BaseSystem):
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                    self.rec_eval_with_weight(batch)
-                    # self.step(batch, stage='rec', mode='test')
+                    if self.use_counterfactual:
+                        self.rec_eval_with_weight(batch)
+                    else:
+                        self.step(batch, stage='rec', mode='test')
                 test_report = self.evaluator.report(mode='test')
                 self.log_wandb_metrics(test_report, stage='rec', mode='test')
 
@@ -628,8 +654,10 @@ class HyCoRecSystem(BaseSystem):
         with torch.no_grad():
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                self.rec_eval_with_weight(batch)
-                # self.step(batch, stage='rec', mode='test')
+                if self.use_counterfactual:
+                    self.rec_eval_with_weight(batch)
+                else:
+                    self.step(batch, stage='rec', mode='test')
             test_report = self.evaluator.report(mode='test')
             self.log_wandb_metrics(test_report, stage='rec', mode='test')
 
@@ -675,7 +703,10 @@ class HyCoRecSystem(BaseSystem):
             prepared_batch,
             batch_item_weights=batch_weights_f['item'],
             batch_entity_weights=batch_weights_f['entity'],
-            batch_word_weights=batch_weights_f['word']
+            batch_word_weights=batch_weights_f['word'],
+            item_view_learner=self.view_learner_item,
+            entity_view_learner=self.view_learner_entity,
+            word_view_learner=self.view_learner_word
         )
         self._debug_check_tensor('train_view_learner_step.scores_f', scores_f)
 
@@ -690,7 +721,10 @@ class HyCoRecSystem(BaseSystem):
             prepared_batch,
             batch_item_weights=batch_weights_cf['item'],
             batch_entity_weights=batch_weights_cf['entity'],
-            batch_word_weights=batch_weights_cf['word']
+            batch_word_weights=batch_weights_cf['word'],
+            item_view_learner=self.view_learner_item,
+            entity_view_learner=self.view_learner_entity,
+            word_view_learner=self.view_learner_word
         )
         self._debug_check_tensor('train_view_learner_step.scores_cf', scores_cf)
         
@@ -769,9 +803,7 @@ class HyCoRecSystem(BaseSystem):
         self._debug_check_module_grads('train_view_learner_step.after_backward', self._view_learners())
         # 做梯度裁剪，避免权重学习过程不稳定。
         view_grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(self.view_learner_item.parameters()) + 
-            list(self.view_learner_entity.parameters()) + 
-            list(self.view_learner_word.parameters()), 
+            self._view_learner_parameters(),
             1.0
         )
         self._debug_check_tensor('train_view_learner_step.view_grad_norm_after_clip', view_grad_norm)
@@ -780,7 +812,6 @@ class HyCoRecSystem(BaseSystem):
         for graph_key, learner in self._view_learners().items():
             for param_name, param in learner.named_parameters():
                 self._debug_check_tensor(f'train_view_learner_step.after_step.{graph_key}.param.{param_name}', param)
-        
         # 记录指标
         self.evaluator.optim_metrics.add("view_loss", AverageMetric(view_loss.item()))
         self.evaluator.optim_metrics.add("loss_f", AverageMetric(loss_f.item()))
@@ -828,7 +859,10 @@ class HyCoRecSystem(BaseSystem):
             prepared_batch,
             batch_item_weights=batch_weights_f['item'],
             batch_entity_weights=batch_weights_f['entity'],
-            batch_word_weights=batch_weights_f['word']
+            batch_word_weights=batch_weights_f['word'],
+            item_view_learner=self.view_learner_item,
+            entity_view_learner=self.view_learner_entity,
+            word_view_learner=self.view_learner_word
         )
         self._debug_check_tensor('train_main_model_step.scores_f', scores_f)
 
@@ -840,7 +874,10 @@ class HyCoRecSystem(BaseSystem):
             prepared_batch,
             batch_item_weights=batch_weights_cf['item'],
             batch_entity_weights=batch_weights_cf['entity'],
-            batch_word_weights=batch_weights_cf['word']
+            batch_word_weights=batch_weights_cf['word'],
+            item_view_learner=self.view_learner_item,
+            entity_view_learner=self.view_learner_entity,
+            word_view_learner=self.view_learner_word
         )
         self._debug_check_tensor('train_main_model_step.scores_cf', scores_cf)
         
@@ -865,7 +902,6 @@ class HyCoRecSystem(BaseSystem):
         # 6. 更新主模型
         # 使用系统已有的 backward 逻辑更新主模型参数。
         self.backward(model_loss)
-        
         # 记录指标
         self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss.item()))
         self.evaluator.optim_metrics.add("model_loss", AverageMetric(model_loss.item()))
