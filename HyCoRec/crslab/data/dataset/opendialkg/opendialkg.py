@@ -158,18 +158,11 @@ class OpenDialKGDataset(BaseDataset):
         augmented_convs = []
         last_role = None
         conv_id = conversation.get("conv_id", idx)
-        related_item = []
-        related_entity = []
-        related_word = []
         for utt in conversation['dialog']:
             text_token_ids = [self.tok2ind.get(word, self.unk_token_idx) for word in utt["text"]]
             item_ids = [self.entity2id[movie] for movie in utt['item'] if movie in self.entity2id]
             entity_ids = [self.entity2id[entity] for entity in utt['entity'] if entity in self.entity2id]
             word_ids = [self.word2id[word] for word in utt['word'] if word in self.word2id]
-
-            related_item += item_ids
-            related_entity += entity_ids
-            related_word += word_ids
 
             if utt["role"] == last_role:
                 augmented_convs[-1]["text"] += text_token_ids
@@ -181,9 +174,9 @@ class OpenDialKGDataset(BaseDataset):
                     "conv_id": conv_id,
                     "role": utt["role"],
                     "text": text_token_ids,
-                    "item": related_item,
-                    "entity": related_entity,
-                    "word": related_word
+                    "item": item_ids,
+                    "entity": entity_ids,
+                    "word": word_ids
                 })
             last_role = utt["role"]
 

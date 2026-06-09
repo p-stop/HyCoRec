@@ -40,6 +40,8 @@ from crslab.model.utils.modules.weighted_hypergraph_conv import WeightedHypergra
 from crslab.model.utils.modules.transformer import TransformerEncoder
 from crslab.model.crs.hycorec.decoder import TransformerDecoderKG
 
+from crslab.model.utils.debug import _numeric_debug_tensor, check
+
 
 def _scatter_mean(values: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
     """Compute mean aggregation over the first dimension with scatter-add."""
@@ -62,75 +64,6 @@ def _scatter_mean(values: torch.Tensor, index: torch.Tensor, dim_size: int) -> t
     # 返回按 group 聚合后的均值。
     return out / count.view(*view_shape)
 
-def check(name, x, log_file="debug.log"):
-    if not isinstance(x, torch.Tensor):
-        all_finite = "non-tensor"
-        min_val = "non-tensor"
-        max_val = "non-tensor"
-    else:
-        finite_mask = torch.isfinite(x)
-        all_finite = finite_mask.all().item()
-        any_finite = finite_mask.any().item()
-
-        if any_finite:
-            finite_vals = x[finite_mask]
-            min_val = finite_vals.min().item()
-            max_val = finite_vals.max().item()
-        else:
-            min_val = "nan"
-            max_val = "nan"
-
-    log_path = os.path.join(os.path.dirname(__file__), log_file) if "__file__" in globals() else log_file
-
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"{name} {all_finite} {min_val} {max_val}\n")
-
-
-def _numeric_debug_location():
-    frame = inspect.currentframe()
-    if frame is None or frame.f_back is None or frame.f_back.f_back is None:
-        return 'unknown'
-    caller = frame.f_back.f_back
-    return f'{os.path.basename(caller.f_code.co_filename)}:{caller.f_lineno}'
-
-
-def _numeric_debug_tensor(owner, name, tensor):
-    if not getattr(owner, 'nan_debug', False):
-        return True
-    if not isinstance(tensor, torch.Tensor):
-        return True
-    if not (tensor.is_floating_point() or tensor.is_complex()):
-        return True
-    if torch.isfinite(tensor).all().item():
-        return True
-
-    with torch.no_grad():
-        detached = tensor.detach()
-        finite_mask = torch.isfinite(detached)
-        finite_count = int(finite_mask.sum().item())
-        total = detached.numel()
-        stats = {
-            'shape': tuple(detached.shape),
-            'dtype': str(detached.dtype),
-            'device': str(detached.device),
-            'finite': f'{finite_count}/{total}',
-            'nan': int(torch.isnan(detached).sum().item()) if detached.is_floating_point() else 0,
-            '+inf': int(torch.isposinf(detached).sum().item()) if detached.is_floating_point() else 0,
-            '-inf': int(torch.isneginf(detached).sum().item()) if detached.is_floating_point() else 0,
-        }
-        if finite_count > 0:
-            finite_vals = detached[finite_mask].float()
-            stats.update({
-                'min': float(finite_vals.min().item()),
-                'max': float(finite_vals.max().item()),
-                'mean': float(finite_vals.mean().item()),
-            })
-
-    message = f"[NUMERIC DEBUG] non-finite tensor '{name}' at {_numeric_debug_location()} stats={stats}"
-    logger.error(message)
-    if getattr(owner, 'nan_debug_raise', True):
-        raise FloatingPointError(message)
-    return False
 class HyCoRecModel(BaseModel):
     """
 
@@ -177,6 +110,7 @@ class HyCoRecModel(BaseModel):
         self.llm = opt.get("llm", "chatgpt-4o")
         assert self.dataset in ['HReDial', 'HTGReDial', 'DuRecDial', 'OpenDialKG', 'ReDial', 'TGReDial']
         # vocab
+        self.item_ids = side_data['item_entity_ids']
         self.pad_token_idx = vocab['tok2ind']['__pad__']
         self.start_token_idx = vocab['tok2ind']['__start__']
         self.end_token_idx = vocab['tok2ind']['__end__']
@@ -273,12 +207,12 @@ class HyCoRecModel(BaseModel):
             if item_a not in entity2id:
                 continue
             item_a = entity2id[item_a]
-            item_list = []
+            convert_list = []
             for item in item_list:
                 if item not in entity2id:
                     continue
-                item_list.append(entity2id[item])
-            item_adj[item_a] = item_list
+                convert_list.append(entity2id[item])
+            item_adj[item_a] = convert_list
         self.item_adj = item_adj
 
         entity_adj = {}
@@ -287,12 +221,12 @@ class HyCoRecModel(BaseModel):
             if entity_a not in entity2id:
                 continue
             entity_a = entity2id[entity_a]
-            entity_list = []
+            convert_list = []
             for entity in entity_list:
                 if entity not in entity2id:
                     continue
-                entity_list.append(entity2id[entity])
-            entity_adj[entity_a] = entity_list
+                convert_list.append(entity2id[entity])
+            entity_adj[entity_a] = convert_list
         self.entity_adj = entity_adj
 
         word_adj = {}
@@ -301,12 +235,12 @@ class HyCoRecModel(BaseModel):
             if word_a not in token2id:
                 continue
             word_a = token2id[word_a]
-            word_list = []
+            convert_list = []
             for word in word_list:
                 if word not in token2id:
                     continue
-                word_list.append(token2id[word])
-            word_adj[word_a] = word_list
+                convert_list.append(token2id[word])
+            word_adj[word_a] = convert_list
         self.word_adj = word_adj
 
         logger.info(f"[Adjacent Matrix built.]")
@@ -503,6 +437,19 @@ class HyCoRecModel(BaseModel):
         return embedding
     
     def encode_user_repr(self, related_items, related_entities, related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding,):
+        # COLD START
+        # if len(related_items) == 0 or len(related_words) == 0:
+        #     if len(related_entities) == 0:
+        #         user_repr = torch.zeros(self.user_emb_dim, device=self.device)
+        #     elif self.pooling == 'Attn':
+        #         user_repr = tot_entity_embedding[related_entities]
+        #         user_repr = self.kg_attn(user_repr)
+        #     else:
+        #         assert self.pooling == 'Mean'
+        #         user_repr = tot_entity_embedding[related_entities]
+        #         user_repr = torch.mean(user_repr, dim=0)
+        #     return user_repr
+        
         # 获取超图后的数据
         item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
         if len(related_items) > 0:
@@ -569,7 +516,7 @@ class HyCoRecModel(BaseModel):
         related_word = batch['related_word']
         item = batch['item']
         item_embedding = self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        entity_embedding = self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
+        entity_embedding = self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)       
         token_embedding = self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
 
         # 获取用户编码
@@ -606,10 +553,12 @@ class HyCoRecModel(BaseModel):
 
         # 先根据 related_nodes 和邻接表构造当前样本的超图。
         hypergraph_nodes, hyper_edge_index = self._get_hypergraph(related_nodes, adj)
+        # logger.info(f"hypergraph_nodes={hypergraph_nodes}, hyper_edge_index={hyper_edge_index}")
         # 再把整图 embedding 裁成当前样本子图所需的节点与边索引。
-        sub_node_embedding, sub_edge_index, _ = self._before_hyperconv(
+        sub_node_embedding, sub_edge_index, tot2sub = self._before_hyperconv(
             total_embedding, hypergraph_nodes, hyper_edge_index, adj
         )
+        # logger.info(f"sub_node_embedding_shape={sub_node_embedding}, sub_edge_index_shape={sub_edge_index}")
         _numeric_debug_tensor(self, '_prepare_single_hypergraph.sub_node_embedding', sub_node_embedding)
 
         # 预先记录超边数量，避免后面重复从索引里计算。
@@ -621,7 +570,9 @@ class HyCoRecModel(BaseModel):
         return {
             'node_embedding': sub_node_embedding,
             'hyper_edge_index': sub_edge_index,
-            'num_hyperedges': num_hyperedges
+            'num_hyperedges': num_hyperedges,
+            'hypergraph_nodes': hypergraph_nodes,
+            'tot2sub': tot2sub
         }
 
     def prepare_recommendation_batch(self, batch, kg_embeddings=None):
@@ -634,6 +585,41 @@ class HyCoRecModel(BaseModel):
         for related_item, related_entity, related_word in zip(
             batch['related_item'], batch['related_entity'], batch['related_word']
         ):
+            # #cold-start
+            # if len(related_item) == 0 or len(related_word) == 0:
+            #     if len(related_entity) == 0:
+            #         batch_graphs.append({
+            #             'item': None,
+            #             'entity': None,
+            #             'word': None,
+            #             'context_embedding': None,
+            #             'cold-start': True,
+            #             'user_repr': torch.zeros(self.user_emb_dim, device=self.device)
+            #         })
+            #         continue
+            #     elif self.pooling == 'Attn':
+            #         context_embedding = kg_embeddings['entity'][related_entity]
+            #         batch_graphs.append({
+            #             'item': None,
+            #             'entity': None,
+            #             'word': None,
+            #             'context_embedding': context_embedding,
+            #             'cold-start': True,
+            #             'user_repr': self.kg_attn(context_embedding)
+            #         })
+            #         continue
+            #     else:
+            #         assert self.pooling == 'Mean'
+            #         context_embedding = kg_embeddings['entity'][related_entity]
+            #         batch_graphs.append({
+            #             'item': None,
+            #             'entity': None,
+            #             'word': None,
+            #             'context_embedding': context_embedding,
+            #             'cold-start': True,
+            #             'user_repr': torch.mean(context_embedding, dim=0)
+            #         })
+            #         continue
             # related_entity 额外用于构造注意力融合时的上下文表示。
             context_embedding = None
             if len(related_entity) > 0:
@@ -644,7 +630,8 @@ class HyCoRecModel(BaseModel):
                 'item': self._prepare_single_hypergraph(related_item, kg_embeddings['item'], self.item_adj),
                 'entity': self._prepare_single_hypergraph(related_entity, kg_embeddings['entity'], self.entity_adj),
                 'word': self._prepare_single_hypergraph(related_word, kg_embeddings['word'], self.word_adj),
-                'context_embedding': context_embedding
+                'context_embedding': context_embedding,
+                'cold-start': False
             })
 
         # 返回推荐阶段需要的全部中间结果。
@@ -661,10 +648,17 @@ class HyCoRecModel(BaseModel):
         # 否则对当前样本子图执行一次 HGCN，可选传入超边权重。
         _numeric_debug_tensor(self, '_run_hypergraph_conv.node_embedding_input', graph_data['node_embedding'])
         _numeric_debug_tensor(self, '_run_hypergraph_conv.hyperedge_weight_input', hyperedge_weight)
+        # if hyperedge_weight is not None:
+            # logger.info(f"weight_shape={hyperedge_weight.shape},incidence_shape={graph_data['hyper_edge_index'].shape}")
+            # weight = hyperedge_weight.view(-1).to(self.device)
+            # logger.info(f"weight_shape={weight.shape},numl={int(graph_data['hyper_edge_index'][1].max()) + 1}")
+            # logger.info(f"node_index={graph_data['hyper_edge_index'][0]},edge_index={graph_data['hyper_edge_index'][1]}")
+            # logger.info(f"weight={hyperedge_weight}")
+
         out = hyper_conv(
             graph_data['node_embedding'],
             graph_data['hyper_edge_index'],
-            hyperedge_weight=hyperedge_weight
+            incidence_weight=hyperedge_weight
         )
         _numeric_debug_tensor(self, '_run_hypergraph_conv.output', out)
         return out
@@ -675,11 +669,17 @@ class HyCoRecModel(BaseModel):
         user_repr_list = []
 
         for idx, sample_graph in enumerate(prepared_batch['graphs']):
+            #cold-start
+            if sample_graph.get('cold-start', False):
+                user_repr_list.append(sample_graph['user_repr'])
+                continue
+
             # 逐样本取出三类图的超边权重；若无权版本则为 None。
             item_weight = batch_item_weights[idx] if batch_item_weights is not None else None
             entity_weight = batch_entity_weights[idx] if batch_entity_weights is not None else None
             word_weight = batch_word_weights[idx] if batch_word_weights is not None else None
             # item/entity/word 三类子图各自执行带权或不带权的 HGCN。
+            # print(f"[BEFORE HGCN] {torch.cuda.memory_allocated()/1e9:.2f} GB")
             item_embedding = self._run_hypergraph_conv(sample_graph['item'], self.hyper_conv_item, item_weight)
             entity_embedding = self._run_hypergraph_conv(sample_graph['entity'], self.hyper_conv_entity, entity_weight)
             word_embedding = self._run_hypergraph_conv(sample_graph['word'], self.hyper_conv_word, word_weight)
@@ -687,6 +687,7 @@ class HyCoRecModel(BaseModel):
             _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].entity_embedding', entity_embedding)
             _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].word_embedding', word_embedding)
             _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].context_embedding', sample_graph['context_embedding'])
+            # print(f"[After HGCN] {torch.cuda.memory_allocated()/1e9:.2f} GB")            
             # 将三路子图表示和上下文表示融合成单个用户向量。
             user_repr = self._attention_and_gating(
                 item_embedding,
@@ -719,10 +720,23 @@ class HyCoRecModel(BaseModel):
         scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)
         _numeric_debug_tensor(self, 'recommend_from_prepared_batch.scores', scores)
         # 交叉熵损失仍使用原始 item 标签监督。
-        loss = self.rec_loss(scores, prepared_batch['item'])
-        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.loss', loss)
-        return loss, scores, prepared_batch['item']
 
+        # 1. 只保留 item 列（与 rec_evaluate 中的逻辑方向一致）
+        item_ids_tensor = torch.tensor(self.item_ids, device=self.device, dtype=torch.long)
+        scores = scores[:, item_ids_tensor]  # (B, len_item_ids)
+
+        # 2. 将 target 从全局 entity ID 映射为 item_ids 内的局部偏移
+        #    与 rec_evaluate 中 self.item_ids.index(label) 逻辑完全一致
+        item_to_idx = {int(eid): i for i, eid in enumerate(self.item_ids)}
+        target_list = [item_to_idx[int(t.item())] for t in prepared_batch['item']]
+        target_idx = torch.tensor(target_list, device=self.device)
+
+        loss = self.rec_loss(scores, target_idx)
+        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.loss', loss)
+
+        rank = (scores.detach().argsort(dim=-1, descending=True) == target_idx.unsqueeze(1)).float().argmax(dim=-1)
+        return loss, scores, target_idx,rank
+    
     def build_batch_hyperedge_weights(self, prepared_batch, item_weight_fn=None,
                                       entity_weight_fn=None, word_weight_fn=None):
         # 保存每个样本、每类图的超边权重。
@@ -794,9 +808,7 @@ class HyCoRecModel(BaseModel):
     def _before_hyperconv(self, embeddings:torch.FloatTensor, hypergraph_items:List[int], edge_index:torch.LongTensor, adj):
         sub_items = []
         edge_index = edge_index.cpu().numpy()
-        for item in hypergraph_items:
-            sub_items += [item] + list(adj.get(item, []))
-        sub_items = list(set(sub_items))
+        sub_items = list(set(hypergraph_items))
         tot2sub = {tot:sub for sub, tot in enumerate(sub_items)}
         sub_embeddings = embeddings[sub_items]
         edge_index = [[tot2sub[v] for v in edge_index[0]], list(edge_index[1])]
