@@ -1,0 +1,24 @@
+program: run_crslab.py
+method: random
+metric:
+  name: rec/valid/recall@50
+  goal: maximize
+
+run_cap: 20
+
+parameters:
+  seed:
+    { value : 3407 }
+  view.ratio:
+    values: [0.85,0.9]
+  view.cf_keep_ratio:
+    values: [0.7,0.6,0.5,0.4]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - -c
+  - config/crs/hycorec/redial.yaml
+  - --wandb_project
+  - HyCoRec
+  - ${args_no_boolean_flags}

@@ -585,7 +585,7 @@ class HyCoRecModel(BaseModel):
         for related_item, related_entity, related_word in zip(
             batch['related_item'], batch['related_entity'], batch['related_word']
         ):
-            # #cold-start
+            #cold-start
             # if len(related_item) == 0 or len(related_word) == 0:
             #     if len(related_entity) == 0:
             #         batch_graphs.append({
@@ -670,9 +670,9 @@ class HyCoRecModel(BaseModel):
 
         for idx, sample_graph in enumerate(prepared_batch['graphs']):
             #cold-start
-            if sample_graph.get('cold-start', False):
-                user_repr_list.append(sample_graph['user_repr'])
-                continue
+            # if sample_graph.get('cold-start', False):
+            #     user_repr_list.append(sample_graph['user_repr'])
+            #     continue
 
             # 逐样本取出三类图的超边权重；若无权版本则为 None。
             item_weight = batch_item_weights[idx] if batch_item_weights is not None else None
@@ -1134,6 +1134,7 @@ class ViewLearner(nn.Module):
         # 先用独立 HypergraphConv 对输入节点特征做一次编码。
         _numeric_debug_tensor(self, 'ViewLearner.forward.node_features_input', node_features)
         encoded_node_feat = self.encoder(node_features, hyper_edge_index)
+        # encoded_node_feat = node_features
         _numeric_debug_tensor(self, 'ViewLearner.forward.encoded_node_feat', encoded_node_feat)
         # 再按配置的聚合方式生成每条超边的表示。
         hedge_embedding = self._aggregate_hyperedge_embedding(encoded_node_feat, hyper_edge_index)

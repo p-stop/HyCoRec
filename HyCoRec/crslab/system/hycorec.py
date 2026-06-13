@@ -39,36 +39,116 @@ def gumbel_softmax(logits, temperature=1.0, clip_eps=0.0):
     if clip_eps > 0:
         probs = probs.clamp(min=clip_eps, max=1.0 - clip_eps)
     return probs
-def gumbel_topk_select(logits, keep_ratio=0.9, hard=True):
+def gumbel_topk_select(weight, keep_ratio=0.9, hard=True, mode='gumbel_topk'):
     """
     替换原来的 gumbel_softmax。
-    keep_ratio: 目标保留比例，比如 0.3~0.6。
+    
+    Args:
+        logits: 超边连接 logits。
+        keep_ratio: 目标保留比例，比如 0.3~0.6。
+        hard: 是否使用硬选择（vs 软选择）。
+        mode: 选边策略
+            - 'gumbel_topk': (默认) Gumbel 噪声 + top-k 选边，当前标准方法。
+            - 'random': 完全随机选边，forward 随机选 k 条边，
+               backward 仍通过直通估计传递 sigmoid(logits) 梯度。
+               用作 ablation baseline：验证 learned selection 是否优于随机。
+    
     返回：硬选择的0/1权重 + 直通梯度估计。
     """
-    # Gumbel 噪声：引入随机性，让探索不遗漏低分边
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
-    noisy_logits = logits + gumbel_noise
+    k = max(1, int(len(weight) * keep_ratio))
+
+    if mode == 'random':
+        # 纯随机选边（ablation baseline）
+        # 随机打乱索引取前 k 个，完全不依赖 logits 排序
+        random_indices = torch.randperm(len(weight), device=weight.device)[:k]
+
+        if hard:
+            hinge = 1e-4
+            weights = torch.full_like(weight, hinge)
+            weights[random_indices] = 1.0 - hinge
+            # 直通梯度估计：forward 用随机硬值，backward 仍用 sigmoid(logits) 的梯度
+            soft_weights = torch.sigmoid(weight)
+            return weights + soft_weights - soft_weights.detach()
+        else:
+            weights = torch.zeros_like(weight)
+            weights[random_indices] = 1.0
+            soft_weights = torch.sigmoid(weight)
+            mask = torch.zeros_like(weight, dtype=torch.bool)
+            mask[random_indices] = True
+            return torch.where(mask, weights, soft_weights.clamp(0.001, 1.0))
+
+    # --- 默认：Gumbel 噪声 + top-k 选边 ---
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(weight) + 1e-8) + 1e-8)
+    noisy_logits = weight + gumbel_noise
     
-    k = max(1, int(len(logits) * keep_ratio))
     _, top_indices = torch.topk(noisy_logits, k)
     
     if hard:
         # 硬选择：top-k 为 1-1e-4，其余为 1e-4
         hinge = 1e-4
-        weights = torch.full_like(logits, hinge)
+        weights = torch.full_like(weight, hinge)
         weights[top_indices] = 1.0 - hinge
         # 直通梯度估计：forward用硬值，backward用 soft logits 的梯度
-        soft_weights = torch.sigmoid(logits)
+        soft_weights = torch.sigmoid(weight)
         return weights + soft_weights - soft_weights.detach()
     else:
         # 软选择：top-k 为 1，其余为 sigmoid（保留梯度）
-        weights = torch.zeros_like(logits)
+        weights = torch.zeros_like(weight)
         weights[top_indices] = 1.0
-        soft_weights = torch.sigmoid(logits)
+        soft_weights = torch.sigmoid(weight)
         # 非 top-k 边也有梯度
-        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask = torch.zeros_like(weight, dtype=torch.bool)
         mask[top_indices] = True
         return torch.where(mask, weights, soft_weights.clamp(0.001, 1.0))
+    
+def counterfactual_topk_select(weight, keep_ratio=0.9, cf_keep_ratio=0.2):
+    """
+    对每个样本的每类图，按 logits 值从高到低分为三档：
+    - 前 cf_keep_ratio 高的连接 → 权重设为 hinge（抑制：ViewLearner 最认可的边）
+    - 中间 (keep_ratio - cf_keep_ratio) → 权重设为 1 - hinge（保留的核心信息边）
+    - 后 (1 - keep_ratio) 低的连接 → 权重设为 hinge（抑制：不重要的边）
+
+    即：仅保留 logits 排名中间段的连接，两端均抑制，构造结构化反事实视图。
+
+    直通梯度估计：forward 使用硬值，backward 梯度流经 sigmoid(logits)。
+
+    Args:
+        batch_logits: {'item': [tensor, ...], 'entity': [...], 'word': [...]}
+                      每个 tensor 是该样本该图类型所有连接的原始 logits（1D）。
+        keep_ratio: 中间+前段的总比例，即 top-keep_ratio 的 logits 参与分配。
+        cf_keep_ratio: 前段（最高 logits）比例，被抑制。
+
+    返回：
+        {'item': [tensor, ...], 'entity': [...], 'word': [...]}
+        与 batch_weights 结构相同的反事实权重字典。
+    """
+    hinge = 1e-4
+    n = len(weight)
+    top_k = max(1, int(n * cf_keep_ratio))
+    mid_k = max(1, int(n * keep_ratio))  # top_keep_ratio 的总数
+
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(weight) + 1e-8) + 1e-8)
+    noisy_logits = weight + gumbel_noise
+    # 按 logits 从高到低排序，取前 mid_k 个索引
+    _, sorted_indices = torch.topk(noisy_logits, mid_k)  # 前 mid_k 个（最高的）
+
+    # 中间 (mid_k - top_k) → 保留为 1 - hinge
+    mid_mask = torch.zeros_like(weight, dtype=torch.bool)
+    mid_mask[sorted_indices[top_k:]] = True
+    # mid_mask[sorted_indices[:top_k]] = True
+
+    # forward 权重：中间段 → 1-hinge，其余（前 top_k + 后段）→ hinge
+    forward_weights = torch.where(
+        mid_mask,
+        torch.full_like(weight, 1.0 - hinge),
+        torch.full_like(weight, hinge)
+    )
+
+    # 直通梯度估计：backward 流经 sigmoid(logits)
+    soft_weights = torch.sigmoid(weight)
+
+    return forward_weights + soft_weights - soft_weights.detach()
+
 def check(name, x, log_file="debug.log"):
     if not isinstance(x, torch.Tensor):
         all_finite = "non-tensor"
@@ -132,6 +212,17 @@ class HyCoRecSystem(BaseSystem):
         
         # ViewLearner 超参数（从配置中读取，设置默认值）
         # 仿照 CACHE/train.py 的参数设置
+        self.deitem_f = self.view_optim_opt.get('deitem_f', False)  # 是否在 ViewLearner 中去掉 item 图（调试用）
+        self.deentity_f = self.view_optim_opt.get('deentity_f', False)  # 是否在 ViewLearner 中去掉 entity 图（调试用）
+        self.deword_f = self.view_optim_opt.get('deword_f', False)  # 是否在 ViewLearner 中去掉 word 图（调试用）
+        self.deitem_cf = self.view_optim_opt.get('deitem_cf', False)  # 是否在 ViewLearner 中去掉 item 图（调试用）
+        self.deentity_cf = self.view_optim_opt.get('deentity_cf', False)  # 是否在 ViewLearner 中去掉 entity 图（调试用）
+        self.deword_cf = self.view_optim_opt.get('deword_cf', False)  # 是否在 ViewLearner 中去掉 word 图（调试用）
+        
+
+        self.cf_keep_ratio = self.view_optim_opt.get('cf_keep_ratio', 0.2)  # 反事实选边的保留比例
+        self.view_enhence = self.view_optim_opt.get('view_enhence', False)  # 是否启用 ViewLearner 增强（反事实训练）
+        self.view_epoch = self.view_optim_opt['epoch']
         self.cf_mix_ratio = self.view_optim_opt.get('cf_mix_ratio', 0.5)  # 反事实样本混入比例
         self.keep_ratio = self.view_optim_opt.get('ratio', 0.6)  # 用于 early stop 的关键指标
         logger.info(f"keep_ratio: {self.keep_ratio}")
@@ -220,7 +311,7 @@ class HyCoRecSystem(BaseSystem):
         """Enable/disable gradients for all parameters in a module."""
         for p in module.parameters():
             p.requires_grad_(requires_grad)
-    def _view_learners(self):###
+    def _view_learners(self):
         # 统一返回三类超图对应的 ViewLearner，便于后续循环处理。
         return {
             'item': self.view_learner_item,
@@ -371,13 +462,19 @@ class HyCoRecSystem(BaseSystem):
         # 这样系统层只关心训练顺序，不再直接操作图构建细节。
         return self._core_model().prepare_recommendation_batch(batch)
 
-    def _build_batch_hyperedge_weights(self, prepared_batch,stage = 'train'):
+    def _build_batch_hyperedge_weights(self, prepared_batch,stage = 0):
         # 拿到底层模型，后面要复用其“连接权重 -> 超边权重”的聚合逻辑。
         core_model = self._core_model()
         # batch_weights 保存每个样本、每种图的超边权重列表，直接供 HGCN 使用。
         batch_weights = {'item': [], 'entity': [], 'word': []}
         # flat_weight_info 把所有样本的权重拍平，便于做正则项统计。
-        flat_weight_info = {'item': [], 'entity': [], 'word': []}
+        batch_cf_weights = {'item': [], 'entity': [], 'word': []}
+
+        #case-study
+        if stage != 11 and stage != 12:
+            stage = 'eval'
+        else:
+            stage = 'eval'
 
         # case study: 保存每个样本的拓扑结构和权重
         if stage != 'train':
@@ -394,6 +491,7 @@ class HyCoRecSystem(BaseSystem):
                 # 如果该样本没有这一类图，就占位为 None。
                 if graph_data is None:
                     batch_weights[graph_key].append(None)
+                    batch_cf_weights[graph_key].append(None)
                     if stage != 'train':
                         sample_topo[graph_key] = {'nodes': [], 'weights': []}
                     continue
@@ -406,13 +504,13 @@ class HyCoRecSystem(BaseSystem):
                 # check(f"{graph_key}_weight_logits", weight_logits)
                 # 用 gumbel-softmax 将 logits 变成可微的连接保留概率。
                 # connection_weight = gumbel_softmax(weight_logits, self.temperature,self.weight_clip_eps)
-                connection_weight = gumbel_topk_select(weight_logits,self.keep_ratio)
+                connection_weight = gumbel_topk_select(weight_logits,self.keep_ratio,mode = 'random')
+                cc_cf_weight = counterfactual_topk_select(weight_logits,self.keep_ratio,self.cf_keep_ratio)
                 # connection_weight = torch.sigmoid(weight_logits)
                 # check(f"{graph_key}_connection_weight", connection_weight)
                 # 保存当前样本当前图类型的超边权重，稍后直接喂给 HGCN。
                 batch_weights[graph_key].append(connection_weight)
-                # 同时把它展平收集起来，用于正则项统计。
-                flat_weight_info[graph_key].append(connection_weight.reshape(-1))
+                batch_cf_weights[graph_key].append(cc_cf_weight)
 
  # ---- case study: 保存拓扑结构和incidence weight ----
                 if stage != 'train':
@@ -420,15 +518,18 @@ class HyCoRecSystem(BaseSystem):
                     tot2sub = graph_data.get('tot2sub', {})
                     sub2tot = {v: k for k, v in tot2sub.items()}  # local → global
                     weight_np = connection_weight.detach().cpu().tolist()
+                    cf_weight_np = cc_cf_weight.detach().cpu().tolist()
                     edge_index_np = edge_index.cpu().tolist()
                     num_edges = graph_data.get('num_hyperedges', 0)
 
                     # 按超边分组
                     topo_per_edge = []
                     weight_per_edge = []
+                    cf_weight_per_edge = []
                     for e in range(num_edges):
                         topo_per_edge.append([])
                         weight_per_edge.append([])
+                        cf_weight_per_edge.append([])
 
                     for conn_idx in range(len(weight_np)):
                         local_node = edge_index_np[0][conn_idx]
@@ -436,10 +537,12 @@ class HyCoRecSystem(BaseSystem):
                         global_node = sub2tot.get(local_node, local_node)
                         topo_per_edge[edge_id].append(global_node)
                         weight_per_edge[edge_id].append(weight_np[conn_idx])
+                        cf_weight_per_edge[edge_id].append(cf_weight_np[conn_idx])
 
                     sample_topo[graph_key] = {
                         'nodes': topo_per_edge,
-                        'weights': weight_per_edge
+                        'weights': weight_per_edge,
+                        'cf_weights': cf_weight_per_edge
                     }
             if stage != 'train':
                 case_study_topo.append(sample_topo)
@@ -448,17 +551,7 @@ class HyCoRecSystem(BaseSystem):
         if stage != 'train':
             self._last_case_study_topo = case_study_topo
 
-        # 将拍平后的权重列表整理成张量字典。
-        weight_info = {}
-        for graph_key, weights in flat_weight_info.items():
-            # 某一类图在整个 batch 中都不存在时，构造零张量避免下游 .mean() 报错。
-            if len(weights) == 0:
-                weight_info[graph_key] = torch.zeros(1, device=self.device)
-            else:
-                # 否则将所有样本的权重拼起来，供正则项统一统计。
-                weight_info[graph_key] = torch.cat(weights, dim=0)
-
-        return batch_weights, weight_info
+        return batch_weights, batch_cf_weights
 
     def _build_counterfactual_weights(self, batch_weights):
         # 反事实视图直接使用补权重：保留概率变为删除概率。
@@ -473,21 +566,7 @@ class HyCoRecSystem(BaseSystem):
                 else:
                     graph_weights.append(1 - weight)
             counterfactual_weights[graph_key] = graph_weights
-
-        #hard convert
-        # counterfactual_weights = {}
-        # for graph_key, weights in batch_weights.items():
-        #     graph_weights = []
-        #     for weight in weights:
-        #         if weight is None:
-        #             graph_weights.append(None)
-        #         else:
-        #             # 只翻转 >0.5 的边，其他保持不变
-        #             w_cf = torch.where(weight > 0.5, 1.0 - weight, weight)
-        #             graph_weights.append(w_cf)
-        #     counterfactual_weights[graph_key] = graph_weights
         return counterfactual_weights
-
     def rec_evaluate(self, rec_predict, item_label, type=""):
         rec_predict = rec_predict.cpu()
         # rec_predict = rec_predict[:, self.item_ids]
@@ -582,7 +661,7 @@ class HyCoRecSystem(BaseSystem):
                 preds = self.model.forward(batch, mode, stage)
                 self.conv_evaluate(preds, batch['response'], batch.get('user_id', None), batch['conv_id'])
 
-    def rec_eval_with_weight(self, batch):
+    def rec_eval_with_weight(self, batch,batch_idx):
 
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
@@ -594,7 +673,7 @@ class HyCoRecSystem(BaseSystem):
 
         rec_loss, scores_orig,ground_truth,origin_rank= core_model.recommend_from_prepared_batch(prepared_batch)
 
-        batch_weights_f, weight_info = self._build_batch_hyperedge_weights(prepared_batch,stage='eval')
+        batch_weights_f, batch_weights_cf = self._build_batch_hyperedge_weights(prepared_batch,stage=batch_idx)
 
         rec_f_loss, scores_f , _,f_rank= core_model.recommend_from_prepared_batch(
             prepared_batch,
@@ -603,7 +682,7 @@ class HyCoRecSystem(BaseSystem):
             batch_word_weights=batch_weights_f['word']
         )
 
-        batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
+        # batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
 
         rec_cf_loss, scores_cf ,_,cf_rank= core_model.recommend_from_prepared_batch(
             prepared_batch,
@@ -686,15 +765,12 @@ class HyCoRecSystem(BaseSystem):
             #     # if (epoch + 1) % 2 == 0:
             #     self.view_lambda *= 0.9
             #     logger.info(f'[Decay view_lambda to {self.view_lambda}]')
+            if epoch != 11 and epoch != 12:
+                self._case_study_samples = []
+                self._case_study_uid_counter = 0
             
             logger.info('[Train]')
             for batch_idx, batch in enumerate(self.train_dataloader.get_rec_data(self.rec_batch_size)):
-                self._debug_context = {
-                    'stage': 'rec',
-                    'mode': 'train',
-                    'epoch': epoch,
-                    'batch_idx': batch_idx,
-                }
                 # 数据移到 GPU
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
@@ -702,10 +778,10 @@ class HyCoRecSystem(BaseSystem):
                 
                 if self.use_counterfactual:
                     # ========== STEP 1: 训练 ViewLearner ==========
-                    self.train_view_learner_step(batch,batch_idx)
+                    self.train_view_learner_step(batch,epoch)
                     
                     # ========== STEP 2: 训练主模型 ==========
-                    self.train_main_model_step(batch)
+                    self.train_main_model_step(batch,epoch)
                 else:
                     # 不使用反事实推理，使用原始训练
                     self.step(batch, stage='rec', mode='train')
@@ -715,14 +791,13 @@ class HyCoRecSystem(BaseSystem):
             # logger.info(f"[DEBUG] gen_metrics keys before report: {list(self.evaluator.gen_metrics.metrics.keys()) if hasattr(self.evaluator.gen_metrics,'metrics') else self.evaluator.gen_metrics}")
             train_report = self.evaluator.report(epoch=epoch, mode='train')
             self.log_wandb_metrics(train_report, stage='rec', mode='train', epoch=epoch)
-            
             # val
             logger.info('[Valid]')
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                     if self.use_counterfactual:
-                        self.rec_eval_with_weight(batch)
+                        self.rec_eval_with_weight(batch,epoch)
                     else:
                         self.step(batch, stage='rec', mode='valid')
                 valid_report = self.evaluator.report(epoch=epoch, mode='valid')
@@ -731,48 +806,67 @@ class HyCoRecSystem(BaseSystem):
                 metric = valid_report.get(
                     self.rec_early_stop_metric,
                 )
-                # now_loss = valid_report.get("view_loss", None)
-                # if now_loss is None:
-                #     # valid 阶段未统计 view_loss（例如只调用了 rec_eval_with_weight）
-                #     # logger.warning('[Valid_lr] view_loss not found in valid_report; skip view_lr decay logic.')
-                #     a = 0
-                # else:
-                #     delta_loss = self.bef_loss - now_loss
-                #     if now_loss > 0.6:
-                #         if (-self.bef_loss * 0.05) < delta_loss < (self.bef_loss * 0.05):
-                #             self.view_lr *= 0.1
-                #             self.view_wd *= 0.1
-                #             logger.info(
-                #                 f'[{epoch}] no significant improvement in view_loss. '
-                #                 f'Decay view_lr to {self.view_lr}, view_wd to {self.view_wd}'
-                #             )
-                #     # 更新基准 loss，供下个 epoch 比较
-                #     self.bef_loss = now_loss           
                 if self.early_stop(metric):
                     break
-            self._save_id_mappings()
-            self._save_case_study()
             # test
             logger.info('[Test]')
             with torch.no_grad():
                 self.evaluator.reset_metrics()
                 for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                     if self.use_counterfactual:
-                        self.rec_eval_with_weight(batch)
+                        self.rec_eval_with_weight(batch,epoch)
                     else:
                         self.step(batch, stage='rec', mode='test')
                 test_report = self.evaluator.report(mode='test')
                 self.log_wandb_metrics(test_report, stage='rec', mode='test')
-            self._save_id_mappings()
-            self._save_case_study()
-
-                    # test
+            # if epoch == 11 or epoch == 12:
+            #     self._save_id_mappings()###case-study
+            #     self._save_case_study()
+        if self.view_enhence:
+            logger.info('[Starting view training]')
+            for epoch in range(self.view_epoch):
+                self.evaluator.reset_metrics()
+                # self.keep_ratio = max(self.keep_ratio * 0.95, 0.7)  # 每个 epoch 衰减 keep_ratio，保持在 [0.1, 1.0] 范围内
+                logger.info(f'[view epoch {str(epoch)}，ratio={self.keep_ratio}]')
+                
+                logger.info('[Train]')
+                for batch_idx, batch in enumerate(self.train_dataloader.get_rec_data(self.rec_batch_size)):
+                    # 数据移到 GPU
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor):
+                            batch[k] = v.to(self.device)
+                    
+                    if self.use_counterfactual:
+                        self.train_view_learner_step(batch,batch_idx)
+                        
+                    else:
+                        # 不使用反事实推理，使用原始训练
+                        self.step(batch, stage='rec', mode='train')
+                
+                train_report = self.evaluator.report(epoch=epoch, mode='train')
+                self.log_wandb_metrics(train_report, stage='rec', mode='train', epoch=epoch)
+                
+                # val
+                logger.info('[Valid]')
+                with torch.no_grad():
+                    self.evaluator.reset_metrics()
+                    for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
+                        if self.use_counterfactual:
+                            self.rec_eval_with_weight(batch,epoch)
+                        else:
+                            self.step(batch, stage='rec', mode='valid')
+                    valid_report = self.evaluator.report(epoch=epoch, mode='valid')
+                    self.log_wandb_metrics(valid_report, stage='rec', mode='valid', epoch=epoch)
+                    # early stop
+                    metric = valid_report.get(
+                        self.rec_early_stop_metric,
+                    )          
         logger.info('[Test]')
         with torch.no_grad():
             self.evaluator.reset_metrics()
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                 if self.use_counterfactual:
-                    self.rec_eval_with_weight(batch)
+                    self.rec_eval_with_weight(batch,epoch)
                 else:
                     self.step(batch, stage='rec', mode='test')
             test_report = self.evaluator.report(mode='test')
@@ -798,26 +892,19 @@ class HyCoRecSystem(BaseSystem):
         core_model = self._core_model()
         # 先完成当前 batch 的 GCN 编码和子图准备，这是后续所有视图的共同输入。
         prepared_batch = self._prepare_recommendation_batch(batch)
-        self._debug_check_prepared_batch('train_view_learner_step.prepared_batch', prepared_batch)
         # item：ground-truth ;RGCN后的kg_embding ; graph*4
         # 1. 原始预测（不带权重）
         with torch.no_grad():
             # 原始分数只作为目标参照，因此不保留梯度。
             _, scores_orig ,targets,_= core_model.recommend_from_prepared_batch(prepared_batch)
-        self._debug_check_tensor('train_view_learner_step.scores_orig', scores_orig)
-        self._debug_check_tensor('train_view_learner_step.targets', targets)
 
         # 2. 当前 batch 先完成 GCN 与子图提取，再交给 ViewLearner 生成超边权重
         # 这里得到的是 factual 视图对应的超边权重，以及用于正则化统计的权重信息。
-        batch_weights_f, weight_info = self._build_batch_hyperedge_weights(prepared_batch,stage='train')
-        self._debug_check_weight_lists('train_view_learner_step.batch_weights_f', batch_weights_f)
+        batch_weights_f, batch_weights_cf = self._build_batch_hyperedge_weights(prepared_batch,stage=batch_idx)
 
         # if (batch_idx<8 or batch_idx>self.rec_batch_size-8):
         #     all_weights = torch.cat([w for w in batch_weights_f['item'] if w is not None])
         #     self._log_weight_distribution(weight_info, tag="factual")  
-        for graph_key, weight in weight_info.items():
-            self._debug_check_tensor(f'train_view_learner_step.weight_info.{graph_key}', weight)
-        # batch_weights_f:(item/entity/word:各个bathc对应图的weight的list)；weight_info:(item/entity/word:三个长tensor用于正则化)
         # 3. 事实预测（带学习到的超边权重）
         # 将 factual 超边权重送入 HGCN，得到事实视图下的推荐分数。
         _, scores_f ,_,_= core_model.recommend_from_prepared_batch(
@@ -826,14 +913,10 @@ class HyCoRecSystem(BaseSystem):
             batch_entity_weights=batch_weights_f['entity'],
             batch_word_weights=batch_weights_f['word']
         )
-        self._debug_check_tensor('train_view_learner_step.scores_f', scores_f)
 
         # 4. 反事实预测（使用补权重）
         # factual 的补权重对应 counterfactual 视图。
-        batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
-        self._debug_check_weight_lists('train_view_learner_step.batch_weights_cf', batch_weights_cf)
-        self._debug_monitor_degree_health('train_view_learner_step.batch_weights_f', prepared_batch, batch_weights_f)
-        self._debug_monitor_degree_health('train_view_learner_step.batch_weights_cf', prepared_batch, batch_weights_cf)
+        # batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
         # 将反事实权重送入 HGCN，得到 counterfactual 分数。
         _, scores_cf ,_,_= core_model.recommend_from_prepared_batch(
             prepared_batch,
@@ -841,85 +924,27 @@ class HyCoRecSystem(BaseSystem):
             batch_entity_weights=batch_weights_cf['entity'],
             batch_word_weights=batch_weights_cf['word']
         )
-        self._debug_check_tensor('train_view_learner_step.scores_cf', scores_cf)
         
         # logger.info(f"scores={scores_orig}\nscores_f={scores_f}\nscores_cf={scores_cf}")
 
         # 5. 计算事实损失和反事实损失
         # 原始分数只作为 teacher logits，不参与梯度传播。
         scores_orig = scores_orig.detach()
-        self._debug_check_tensor('train_view_learner_step.scores_orig_norm', scores_orig)
         # factual 分数应尽量贴近原始分数的偏好方向。
         loss_f = self.factual_loss(scores_orig, scores_f)
-        self._debug_check_tensor('train_view_learner_step.loss_f', loss_f)
         # counterfactual 目标：尽量与原始预测相反。
         loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
-        self._debug_check_tensor('train_view_learner_step.loss_cf', loss_cf)
-
-        # 6. 计算边权重正则化（鼓励保留更多边）
-        # 分别取三类图的超边权重。
-        item_weight = weight_info['item']
-        entity_weight = weight_info['entity']
-        word_weight = weight_info['word']
-        # 将三类图的平均保留权重相加，作为整体图稀疏度约束。
-        aug_weight_mean = item_weight.mean() + entity_weight.mean() + word_weight.mean()
-        if self.same_view:
-            aug_weight_mean /= 3  # 如果三类图共享权重学习器，平均一下避免数值过大。
-        self._debug_check_tensor('train_view_learner_step.aug_weight_mean', aug_weight_mean)
 
         # 7. view_loss = α * loss_f + (1-α) * loss_cf + λ * mean(aug_weight)
         # factual/counterfactual 损失控制视图质量，正则项控制不要过度删边。
         # aug_weight_mean=0
         view_loss = (self.view_alpha * loss_f + 
-                     (1 - self.view_alpha) * loss_cf + 
-                     self.view_lambda * aug_weight_mean)
-        self._debug_check_tensor('train_view_learner_step.view_loss', view_loss)
-        
-        if not torch.isfinite(view_loss):
-            logger.error(
-                f"[NaN/Inf] view_loss={view_loss.item()} "
-                f"loss_f={loss_f.item()} loss_cf={loss_cf.item()} "
-                f"aug_weight_mean={aug_weight_mean.item()} "
-                f"view_alpha={self.view_alpha} view_lambda={self.view_lambda}"
-            )
-            # record something so train.report is not empty and you can see the failure rate
-            self.evaluator.optim_metrics.add("view_loss_nan", AverageMetric(1.0))
-            self._set_requires_grad(self.model, True)
-            return
-        else:
-            self.evaluator.optim_metrics.add("view_loss_nan", AverageMetric(0.0))
-        
+                     (1 - self.view_alpha) * loss_cf)
         # 8. 更新 ViewLearner
         # 先清空 ViewLearner 梯度。
         self.view_optimizer.zero_grad()
         # 只对 ViewLearner 相关参数反向传播。
-        try:
-            with self._debug_anomaly_context():
-                view_loss.backward()
-            self.evaluator.optim_metrics.add("view_backward_nan", AverageMetric(0.0))
-        except RuntimeError as error:
-            logger.error(
-                f"[VIEW BACKWARD FAILED] {error}; "
-                f"context={getattr(self, '_debug_context', {})}"
-            )
-            self._dump_view_backward_snapshot(
-                error,
-                scores_orig,
-                scores_f,
-                scores_cf,
-                loss_f,
-                loss_cf,
-                aug_weight_mean,
-                view_loss,
-                batch_weights_f,
-                batch_weights_cf
-            )
-            self.evaluator.optim_metrics.add("view_backward_nan", AverageMetric(1.0))
-            self._set_requires_grad(self.model, True)
-            if self.nan_debug_raise:
-                raise
-            return
-        self._debug_check_module_grads('train_view_learner_step.after_backward', self._view_learners())
+        view_loss.backward()
         # 做梯度裁剪，避免权重学习过程不稳定。
         view_grad_norm = torch.nn.utils.clip_grad_norm_(
             list(self.view_learner_item.parameters()) + 
@@ -927,22 +952,16 @@ class HyCoRecSystem(BaseSystem):
             list(self.view_learner_word.parameters()), 
             1.0
         )
-        self._debug_check_tensor('train_view_learner_step.view_grad_norm_after_clip', view_grad_norm)
         # 执行一次优化更新。
         self.view_optimizer.step()
-        for graph_key, learner in self._view_learners().items():
-            for param_name, param in learner.named_parameters():
-                self._debug_check_tensor(f'train_view_learner_step.after_step.{graph_key}.param.{param_name}', param)
-        
         # 记录指标
         self.evaluator.optim_metrics.add("view_loss", AverageMetric(view_loss.item()))
         self.evaluator.optim_metrics.add("loss_f", AverageMetric(loss_f.item()))
         self.evaluator.optim_metrics.add("loss_cf", AverageMetric(loss_cf.item()))
-        self.evaluator.optim_metrics.add("aug_weight_mean", AverageMetric(aug_weight_mean))
 
         self._set_requires_grad(self.model, True)
 
-    def train_main_model_step(self, batch):
+    def train_main_model_step(self, batch,batch_idx):
         """
         训练主模型（ViewLearner 在 eval 模式）
         
@@ -972,7 +991,7 @@ class HyCoRecSystem(BaseSystem):
         # 2. 再交给 ViewLearner 生成超边权重
         # 主模型训练时不更新 ViewLearner，因此这里用 no_grad。
         with torch.no_grad():
-            batch_weights_f, _ = self._build_batch_hyperedge_weights(prepared_batch,stage='train')
+            batch_weights_f, batch_weights_cf = self._build_batch_hyperedge_weights(prepared_batch,stage=batch_idx)
         self._debug_check_weight_lists('train_main_model_step.batch_weights_f', batch_weights_f)
 
         # 3. 选择是否带权重地执行 HGCN
@@ -986,7 +1005,7 @@ class HyCoRecSystem(BaseSystem):
         self._debug_check_tensor('train_main_model_step.scores_f', scores_f)
 
         # 反事实视图：使用 factual 权重的补集。
-        batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
+        # batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
         self._debug_check_weight_lists('train_main_model_step.batch_weights_cf', batch_weights_cf)
         # 反事实 HGCN 前向，用于构造对比约束。
         _, scores_cf ,_,cf_rank= core_model.recommend_from_prepared_batch(
@@ -998,7 +1017,7 @@ class HyCoRecSystem(BaseSystem):
         self._debug_check_tensor('train_main_model_step.scores_cf', scores_cf)
         
         # ---- case study: 收集并保存本batch的数据 ----
-        # self._collect_case_study_batch(prepared_batch, origin_rank, f_rank, cf_rank)
+        self._collect_case_study_batch(prepared_batch, origin_rank, f_rank, cf_rank)
 
         # 5. 计算事实损失和反事实损失
         # 原始分数只作为 teacher logits，不参与梯度传播。
