@@ -16,105 +16,6 @@ from crslab.evaluator.metrics.base import AverageMetric
 from crslab.evaluator.metrics.gen import PPLMetric
 from crslab.system.base import BaseSystem
 from crslab.system.utils.functions import ind2txt
-from crslab.model.crs.hycorec.hycorec import ViewLearner
-def gumbel_softmax(logits, temperature=1.0, clip_eps=0.0):
-    """Gumbel-Softmax trick for differentiable sampling"""
-    bias = 0.0001
-    eps = (bias - (1 - bias)) * torch.rand(logits.size(), device=logits.device) + (1 - bias)
-    gate_inputs = torch.log(eps) - torch.log(1 - eps)
-    gate_inputs = (gate_inputs + logits) / temperature
-    probs = torch.sigmoid(gate_inputs).reshape(-1)
-    if clip_eps > 0:
-        probs = probs.clamp(min=clip_eps, max=1.0 - clip_eps)
-    return probs
-def gumbel_topk_select(weight, keep_ratio=0.9, mode='gumbel_topk'):
-    """
-    Args:
-        logits: 超边连接 logits。
-        keep_ratio: 目标保留比例，比如 0.3~0.6。
-        mode: 选边策略
-            - 'gumbel_topk': (默认) Gumbel 噪声 + top-k 选边，当前标准方法。
-            - 'random': 完全随机选边，forward 随机选 k 条边，
-               backward 仍通过直通估计传递 sigmoid(logits) 梯度。
-               用作 ablation baseline：验证 learned selection 是否优于随机。
-    
-    返回：硬选择的0/1权重 + 直通梯度估计。
-    """
-    k = max(1, int(len(weight) * keep_ratio))
-
-    if mode == 'random':
-        # 纯随机选边（ablation baseline）
-        # 随机打乱索引取前 k 个，完全不依赖 logits 排序
-        random_indices = torch.randperm(len(weight), device=weight.device)[:k]
-
-        hinge = 1e-4
-        weights = torch.full_like(weight, hinge)
-        weights[random_indices] = 1.0 - hinge
-        # 直通梯度估计：forward 用随机硬值，backward 仍用 sigmoid(logits) 的梯度
-        soft_weights = torch.sigmoid(weight)
-        return weights + soft_weights - soft_weights.detach()
-
-    # --- 默认：Gumbel 噪声 + top-k 选边 ---
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(weight) + 1e-8) + 1e-8)
-    noisy_logits = weight + gumbel_noise
-    
-    _, top_indices = torch.topk(noisy_logits, k)
-    
-    # 硬选择：top-k 为 1-1e-4，其余为 1e-4
-    hinge = 1e-4
-    weights = torch.full_like(weight, hinge)
-    weights[top_indices] = 1.0 - hinge
-    # 直通梯度估计：forward用硬值，backward用 soft logits 的梯度(不用sigmoid也行)
-    soft_weights = torch.sigmoid(weight)
-    return weights + soft_weights - soft_weights.detach()
-    
-def counterfactual_topk_select(weight, keep_ratio=0.9, cf_keep_ratio=0.2):
-    """
-    对每个样本的每类图，按 logits 值从高到低分为三档：
-    - 前 cf_keep_ratio 高的连接 → 权重设为 hinge（抑制：ViewLearner 最认可的边）
-    - 中间 (keep_ratio - cf_keep_ratio) → 权重设为 1 - hinge（保留的核心信息边）
-    - 后 (1 - keep_ratio) 低的连接 → 权重设为 hinge（抑制：不重要的边）
-
-    即：仅保留 logits 排名中间段的连接，两端均抑制，构造结构化反事实视图。
-
-    直通梯度估计：forward 使用硬值，backward 梯度流经 sigmoid(logits)。
-
-    Args:
-        batch_logits: {'item': [tensor, ...], 'entity': [...], 'word': [...]}
-                      每个 tensor 是该样本该图类型所有连接的原始 logits（1D）。
-        keep_ratio: 中间+前段的总比例，即 top-keep_ratio 的 logits 参与分配。
-        cf_keep_ratio: 前段（最高 logits）比例，被抑制。
-
-    返回：
-        {'item': [tensor, ...], 'entity': [...], 'word': [...]}
-        与 batch_weights 结构相同的反事实权重字典。
-    """
-    hinge = 1e-4
-    n = len(weight)
-    top_k = max(1, int(n * cf_keep_ratio))
-    mid_k = max(1, int(n * keep_ratio))  # top_keep_ratio 的总数
-
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(weight) + 1e-8) + 1e-8)
-    noisy_logits = weight + gumbel_noise
-    # 按 logits 从高到低排序，取前 mid_k 个索引
-    _, sorted_indices = torch.topk(noisy_logits, mid_k)  # 前 mid_k 个（最高的）
-
-    # 中间 (mid_k - top_k) → 保留为 1 - hinge
-    mid_mask = torch.zeros_like(weight, dtype=torch.bool)
-    mid_mask[sorted_indices[top_k:]] = True
-    # mid_mask[sorted_indices[:top_k]] = True
-
-    # forward 权重：中间段 → 1-hinge，其余（前 top_k + 后段）→ hinge
-    forward_weights = torch.where(
-        mid_mask,
-        torch.full_like(weight, 1.0 - hinge),
-        torch.full_like(weight, hinge)
-    )
-
-    # 直通梯度估计：backward 流经 sigmoid(logits)
-    soft_weights = torch.sigmoid(weight)
-
-    return forward_weights + soft_weights - soft_weights.detach()
 
 class HyCoRecSystem(BaseSystem):
     """
@@ -165,17 +66,14 @@ class HyCoRecSystem(BaseSystem):
         self.en_case_study = self.view_optim_opt.get('en_case_study', False)  # 是否启用 case study
         
 
-        self.cf_keep_ratio = self.view_optim_opt.get('cf_keep_ratio', 0.2)  # 反事实选边的保留比例
         self.view_enhence = self.view_optim_opt.get('view_enhence', False)  # 是否启用 ViewLearner 增强（反事实训练）
         self.view_epoch = self.view_optim_opt['epoch']
         self.cf_mix_ratio = self.view_optim_opt.get('cf_mix_ratio', 0.5)  # 反事实样本混入比例
-        self.keep_ratio = self.view_optim_opt.get('ratio', 0.6)  # 用于 early stop 的关键指标
+        self.keep_ratio = self.view_optim_opt.get('ratio', 0.6)
         logger.info(f"keep_ratio: {self.keep_ratio}")
         self.f_mode = self.view_optim_opt.get('f_mode', 2)  # factual loss 版本选择
         self.cf_mode = self.view_optim_opt.get('cf_mode', 3)  # counterfactual loss 版本选择
         self.kg_emb_dim = opt.get('kg_emb_dim', 128)
-        self.view_hidden_dim = self.view_optim_opt.get('view_hidden_dim', 64)  # ViewLearner 隐藏层维度
-        self.view_hyperedge_aggregation = self.view_optim_opt.get('hyperedge_aggregation', 'mean')
         self.view_lr = self.view_optim_opt.get('view_lr', 0.01)       # CACHE 默认 1e-2
         self.view_wd = self.view_optim_opt.get('view_wd', 0.001)      # CACHE 默认 1e-3
         self.view_alpha = self.view_optim_opt.get('view_alpha', 0.5)  # factual vs counterfactual 权重
@@ -184,7 +82,6 @@ class HyCoRecSystem(BaseSystem):
         self.gamma = self.view_optim_opt.get('gamma', 0.5)            # hinge loss margin
         self.temperature = self.view_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
         self.use_counterfactual = self.view_optim_opt.get('use_counterfactual', True)
-        self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
         self.tem_decay = self.view_optim_opt.get('tem_decay', False)  # 是否启用温度衰减（调试用）
         self.loss_tau = self.view_optim_opt.get('loss_tau', self.view_optim_opt.get('tau', 1.0))  # KL 蒸馏温度
         self.loss_topk = self.view_optim_opt.get('loss_topk', self.view_optim_opt.get('topk', 50))  # 排名损失使用的 top-k
@@ -217,37 +114,6 @@ class HyCoRecSystem(BaseSystem):
         self.pretrain_save_path = self.view_optim_opt.get('pretrain_save_path', './pretrain_models')
         self.pretrain_model_name = self.view_optim_opt.get('pretrain_model_name',None)
         
-        # 构建 ViewLearner（为三种超图各一个）
-        # 注意：ViewLearner 需要能直接处理节点特征和超边索引
-        if(self.same_view):
-            self.view_learner_item = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
-            self.view_learner_entity = self.view_learner_item  # 共享权重
-            self.view_learner_word = self.view_learner_item    # 共享权
-        else:
-            self.view_learner_item = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
-            self.view_learner_entity = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
-            self.view_learner_word = ViewLearner(
-                self.kg_emb_dim,
-                self.view_hidden_dim,
-                self.device,
-                hyperedge_aggregation=self.view_hyperedge_aggregation
-            ).to(self.device)
-
     def _core_model(self):
         """Return the underlying model for both plain and DataParallel wrappers."""
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -255,13 +121,50 @@ class HyCoRecSystem(BaseSystem):
         """Enable/disable gradients for all parameters in a module."""
         for p in module.parameters():
             p.requires_grad_(requires_grad)
-    def _view_learners(self):
-        # 统一返回三类超图对应的 ViewLearner，便于后续循环处理。
-        return {
-            'item': self.view_learner_item,
-            'entity': self.view_learner_entity,
-            'word': self.view_learner_word
-        }
+
+    def _view_learner_modules(self):
+        core_model = self._core_model()
+        return (
+            core_model.view_learner_item,
+            core_model.view_learner_entity,
+            core_model.view_learner_word
+        )
+
+    def _unique_view_learner_modules(self):
+        modules = []
+        seen = set()
+        for module in self._view_learner_modules():
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            modules.append(module)
+        return modules
+
+    def _view_learner_parameters(self):
+        params = []
+        seen = set()
+        for module in self._unique_view_learner_modules():
+            for param in module.parameters():
+                param_id = id(param)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                params.append(param)
+        return params
+
+    def _set_view_learners_mode(self, training: bool):
+        for module in self._unique_view_learner_modules():
+            module.train(training)
+
+    def _set_view_learner_requires_grad(self, requires_grad: bool):
+        for param in self._view_learner_parameters():
+            param.requires_grad_(requires_grad)
+
+    def _sync_view_hparams_to_model(self):
+        core_model = self._core_model()
+        if hasattr(core_model, 'keep_ratio'):
+            core_model.keep_ratio = self.keep_ratio
 
     def _debug_check_weight_lists(self, name, batch_weights):
         """check if any weight is nan/inf"""
@@ -298,94 +201,6 @@ class HyCoRecSystem(BaseSystem):
         # 这样系统层只关心训练顺序，不再直接操作图构建细节。
         return self._core_model().prepare_recommendation_batch(batch)
 
-    def _build_batch_hyperedge_weights(self, prepared_batch,stage = 0):
-        # batch_weights 保存每个样本、每种图的超边权重列表，直接供 HGCN 使用。
-        batch_weights = {'item': [], 'entity': [], 'word': []}
-        # flat_weight_info 把所有样本的权重拍平，便于做正则项统计。
-        batch_cf_weights = {'item': [], 'entity': [], 'word': []}
-
-        #case-study
-        if stage != 11 and stage != 12:
-            stage = 'eval'
-        else:
-            stage = 'eval'
-
-        # case study: 保存每个样本的拓扑结构和权重
-        if stage != 'train':
-            case_study_topo = []
-
-        # 逐样本处理，因为每个样本的子图大小都可能不同。
-        for sample_graph in prepared_batch['graphs']:
-            if stage != 'train':
-                sample_topo = {}
-            # item/entity/word 三种超图共享同一套权重生成流程。
-            for graph_key, learner in self._view_learners().items():
-                # 取出当前样本在某一类图上的子图数据。
-                graph_data = sample_graph[graph_key]
-                # 如果该样本没有这一类图，就占位为 None。
-                if graph_data is None:
-                    batch_weights[graph_key].append(None)
-                    batch_cf_weights[graph_key].append(None)
-                    if stage != 'train':
-                        sample_topo[graph_key] = {'nodes': [], 'weights': []}
-                    continue
-
-                # ViewLearner 先基于“节点特征 + 关联关系”输出连接级 logits。
-                weight_logits = learner(
-                    graph_data['node_embedding'],
-                    graph_data['hyper_edge_index']
-                )
-                # check(f"{graph_key}_weight_logits", weight_logits)
-                # 用 gumbel-softmax 将 logits 变成可微的连接保留概率。
-                # connection_weight = gumbel_softmax(weight_logits, self.temperature,self.weight_clip_eps)
-                connection_weight = gumbel_topk_select(weight_logits,self.keep_ratio,mode = 'random')
-                cc_cf_weight = counterfactual_topk_select(weight_logits,self.keep_ratio,self.cf_keep_ratio)
-                # connection_weight = torch.sigmoid(weight_logits)
-                # check(f"{graph_key}_connection_weight", connection_weight)
-                # 保存当前样本当前图类型的超边权重，稍后直接喂给 HGCN。
-                batch_weights[graph_key].append(connection_weight)
-                batch_cf_weights[graph_key].append(cc_cf_weight)
-
- # ---- case study: 保存拓扑结构和incidence weight ----
-                if stage != 'train':
-                    edge_index = graph_data['hyper_edge_index']  # [2, num_conn] local indices
-                    tot2sub = graph_data.get('tot2sub', {})
-                    sub2tot = {v: k for k, v in tot2sub.items()}  # local → global
-                    weight_np = connection_weight.detach().cpu().tolist()
-                    cf_weight_np = cc_cf_weight.detach().cpu().tolist()
-                    edge_index_np = edge_index.cpu().tolist()
-                    num_edges = graph_data.get('num_hyperedges', 0)
-
-                    # 按超边分组
-                    topo_per_edge = []
-                    weight_per_edge = []
-                    cf_weight_per_edge = []
-                    for e in range(num_edges):
-                        topo_per_edge.append([])
-                        weight_per_edge.append([])
-                        cf_weight_per_edge.append([])
-
-                    for conn_idx in range(len(weight_np)):
-                        local_node = edge_index_np[0][conn_idx]
-                        edge_id = edge_index_np[1][conn_idx]
-                        global_node = sub2tot.get(local_node, local_node)
-                        topo_per_edge[edge_id].append(global_node)
-                        weight_per_edge[edge_id].append(weight_np[conn_idx])
-                        cf_weight_per_edge[edge_id].append(cf_weight_np[conn_idx])
-
-                    sample_topo[graph_key] = {
-                        'nodes': topo_per_edge,
-                        'weights': weight_per_edge,
-                        'cf_weights': cf_weight_per_edge
-                    }
-            if stage != 'train':
-                case_study_topo.append(sample_topo)
-
-            # 保存到实例变量，供 train_main_model_step 使用
-        if stage != 'train':
-            self._last_case_study_topo = case_study_topo
-
-        return batch_weights, batch_cf_weights
     def rec_evaluate(self, rec_predict, item_label, type=""):
         rec_predict = rec_predict.cpu()
         # rec_predict = rec_predict[:, self.item_ids]
@@ -410,7 +225,7 @@ class HyCoRecSystem(BaseSystem):
         # top-k indices per view  — 所有 scores 已 slice 到 item 列，排名对应局部索引
         _, ranks_orig = torch.topk(scores_orig, k, dim=-1)   # [B, k]
         _, ranks_f    = torch.topk(scores_f,    k, dim=-1)
-        _, ranks_cf   = torch.topk(scores_cf,   k, dim=-1) ， 
+        _, ranks_cf   = torch.topk(scores_cf,   k, dim=-1)
 
         # ground_truth 已经是 recommend_from_prepared_batch 返回的局部索引
         gt_idx = ground_truth  # [B], dtype long, values in [0, len(item_ids))
@@ -490,28 +305,17 @@ class HyCoRecSystem(BaseSystem):
 
         prepared_batch = self._prepare_recommendation_batch(batch)
 
-        rec_loss, scores_orig,ground_truth,origin_rank= core_model.recommend_from_prepared_batch(prepared_batch)
-
-        batch_weights_f, batch_weights_cf = self._build_batch_hyperedge_weights(prepared_batch,stage=batch_idx)
-
-        rec_f_loss, scores_f , _,f_rank= core_model.recommend_from_prepared_batch(
+        (
+            rec_loss, scores_orig, ground_truth, origin_rank,
+            _, scores_f, f_rank,
+            _, scores_cf, cf_rank
+        ) = core_model.recommend_from_prepared_batch(
             prepared_batch,
-            batch_item_weights=batch_weights_f['item'],
-            batch_entity_weights=batch_weights_f['entity'],
-            batch_word_weights=batch_weights_f['word']
+            build_hyperedge_weights=True
         )
 
-        # batch_weights_cf = self._build_counterfactual_weights(batch_weights_f)
-
-        rec_cf_loss, scores_cf ,_,cf_rank= core_model.recommend_from_prepared_batch(
-            prepared_batch,
-            batch_item_weights=batch_weights_cf['item'],
-            batch_entity_weights=batch_weights_cf['entity'],
-            batch_word_weights=batch_weights_cf['word']
-        )
-
-        loss_f = self.factual_loss(scores_orig, scores_f)
-        loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
+        loss_f = self.factual_loss(scores_orig.detach(), scores_f)
+        loss_cf = self.counterfactual_loss(scores_orig.detach(), scores_cf)
 
         self.rec_evaluate(scores_orig, ground_truth)
         self.rec_evaluate(scores_f, ground_truth, type="f")
@@ -525,6 +329,7 @@ class HyCoRecSystem(BaseSystem):
         self.evaluator.optim_metrics.add("loss_cf", AverageMetric(loss_cf.item()))
         # ---- case study: 收集并保存本batch的数据 ----
         if self.en_case_study:
+            self._last_case_study_topo = getattr(core_model, '_last_case_study_topo', [])
             self._collect_case_study_batch(prepared_batch, origin_rank, f_rank, cf_rank)
 
 
@@ -535,11 +340,7 @@ class HyCoRecSystem(BaseSystem):
         # initialize optimalizers
         self.init_optim(self.rec_optim_opt, self.model.parameters())
 
-        view_params = (
-            list(self.view_learner_item.parameters()) + 
-            list(self.view_learner_entity.parameters()) + 
-            list(self.view_learner_word.parameters())
-        )
+        view_params = self._view_learner_parameters()
         self.view_optimizer = torch.optim.Adam(view_params, lr=self.view_lr, weight_decay=self.view_wd)
 
  # ==================== 预训练阶段 ====================
@@ -673,47 +474,28 @@ class HyCoRecSystem(BaseSystem):
         3. 用边权重做事实预测和反事实预测
         4. 计算 view_loss 并更新 ViewLearner
         """
-        self.view_learner_item.train()
-        self.view_learner_entity.train()
-        self.view_learner_word.train()
         # 训练 ViewLearner 时冻结主模型，只让权重学习器更新。
         self.model.eval()
         self._set_requires_grad(self.model, False)
+        self._set_view_learners_mode(True)
+        self._set_view_learner_requires_grad(True)
         # 取到底层模型，避免 DataParallel 包装影响自定义方法调用。
         core_model = self._core_model()
+
+        # 针对view_enhence模式，确保模型内部的 keep_ratio 与系统层同步
+        self._sync_view_hparams_to_model()
+
         # 先完成当前 batch 的 GCN 编码和子图准备，这是后续所有视图的共同输入。
         prepared_batch = self._prepare_recommendation_batch(batch)
-        # item：ground-truth ;RGCN后的kg_embding ; graph*4
-        # 1. 原始预测（不带权重）
-        with torch.no_grad():
-            # 原始分数只作为目标参照，因此不保留梯度。
-            _, scores_orig ,targets,_= core_model.recommend_from_prepared_batch(prepared_batch)
 
-        # 2. 当前 batch 先完成 GCN 与子图提取，再交给 ViewLearner 生成超边权重
-        # 这里得到的是 factual 视图对应的超边权重，以及用于正则化统计的权重信息。
-        batch_weights_f, batch_weights_cf = self._build_batch_hyperedge_weights(prepared_batch,stage=batch_idx)
-
-        # examine weight distribution
-        # if (batch_idx<8 or batch_idx>self.rec_batch_size-8):
-        #     all_weights = torch.cat([w for w in batch_weights_f['item'] if w is not None])
-        #     self._log_weight_distribution(weight_info, tag="factual")
-  
-        # 3. 事实预测（带学习到的超边权重）
-        # 将 factual 超边权重送入 HGCN，得到事实视图下的推荐分数。
-        _, scores_f ,_,_= core_model.recommend_from_prepared_batch(
+        # 一次前向同时得到原图、事实图和反事实图的分数；权重由 model 内部逐层生成。
+        (
+            _, scores_orig, _, _,
+            _, scores_f, _,
+            _, scores_cf, _
+        ) = core_model.recommend_from_prepared_batch(
             prepared_batch,
-            batch_item_weights=batch_weights_f['item'],
-            batch_entity_weights=batch_weights_f['entity'],
-            batch_word_weights=batch_weights_f['word']
-        )
-
-        # 4. 反事实预测（使用补权重）
-        # 将反事实权重送入 HGCN，得到 counterfactual 分数。
-        _, scores_cf ,_,_= core_model.recommend_from_prepared_batch(
-            prepared_batch,
-            batch_item_weights=batch_weights_cf['item'],
-            batch_entity_weights=batch_weights_cf['entity'],
-            batch_word_weights=batch_weights_cf['word']
+            build_hyperedge_weights=True
         )
 
         # 5. 计算事实损失和反事实损失
@@ -735,12 +517,7 @@ class HyCoRecSystem(BaseSystem):
         # 只对 ViewLearner 相关参数反向传播。
         view_loss.backward()
         # 做梯度裁剪，避免权重学习过程不稳定。
-        view_grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(self.view_learner_item.parameters()) + 
-            list(self.view_learner_entity.parameters()) + 
-            list(self.view_learner_word.parameters()), 
-            1.0
-        )
+        view_grad_norm = torch.nn.utils.clip_grad_norm_(self._view_learner_parameters(), 1.0)
         # 执行一次优化更新。
         self.view_optimizer.step()
         # 记录指标
@@ -761,49 +538,33 @@ class HyCoRecSystem(BaseSystem):
         4. 更新主模型
         """
         self.model.train()
-        self.view_learner_item.eval()
-        self.view_learner_entity.eval()
-        self.view_learner_word.eval()
+        self._set_view_learners_mode(False)
+        self._set_view_learner_requires_grad(False)
         # 主模型更新阶段仍然复用同一批预处理后的图数据。
         core_model = self._core_model()
+        self._sync_view_hparams_to_model()
         # 先做 batch 级图准备，再进入权重预测和 HGCN。
         prepared_batch = self._prepare_recommendation_batch(batch)
         self._debug_check_prepared_batch('train_main_model_step.prepared_batch', prepared_batch)
 
-        # 1. 每个 batch 先完成 GCN 编码和当前 batch 子图提取
-        # 原始视图不带权重，直接作为主任务基线损失。
-        rec_loss, scores_orig,targets,origin_rank= core_model.recommend_from_prepared_batch(prepared_batch)
+        # 一次前向同时得到原图、事实图和反事实图三套 loss/score/rank。
+        (
+            rec_loss, scores_orig, targets, origin_rank,
+            _, scores_f, f_rank,
+            _, scores_cf, cf_rank
+        ) = core_model.recommend_from_prepared_batch(
+            prepared_batch,
+            build_hyperedge_weights=True
+        )
         self._debug_check_tensor('train_main_model_step.rec_loss', rec_loss)
         self._debug_check_tensor('train_main_model_step.scores_orig', scores_orig)
         self._debug_check_tensor('train_main_model_step.targets', targets)
-
-        # 2. 再交给 ViewLearner 生成超边权重
-        # 主模型训练时不更新 ViewLearner，因此这里用 no_grad。
-        with torch.no_grad():
-            batch_weights_f, batch_weights_cf = self._build_batch_hyperedge_weights(prepared_batch,stage=batch_idx)
-        self._debug_check_weight_lists('train_main_model_step.batch_weights_f', batch_weights_f)
-        self._debug_check_weight_lists('train_main_model_step.batch_weights_cf', batch_weights_cf)
-        # 3. 选择是否带权重地执行 HGCN
-        # factual 视图：使用学习到的超边权重。
-        _, scores_f ,_,f_rank= core_model.recommend_from_prepared_batch(
-            prepared_batch,
-            batch_item_weights=batch_weights_f['item'],
-            batch_entity_weights=batch_weights_f['entity'],
-            batch_word_weights=batch_weights_f['word']
-        )
         self._debug_check_tensor('train_main_model_step.scores_f', scores_f)
-
-        # 反事实 HGCN 前向，用于构造对比约束。
-        _, scores_cf ,_,cf_rank= core_model.recommend_from_prepared_batch(
-            prepared_batch,
-            batch_item_weights=batch_weights_cf['item'],
-            batch_entity_weights=batch_weights_cf['entity'],
-            batch_word_weights=batch_weights_cf['word']
-        )
         self._debug_check_tensor('train_main_model_step.scores_cf', scores_cf)
-        
+
         # ---- case study: 收集并保存本batch的数据 ----
         if self.en_case_study:
+            self._last_case_study_topo = getattr(core_model, '_last_case_study_topo', [])
             self._collect_case_study_batch(prepared_batch, origin_rank, f_rank, cf_rank)
 
         # 5. 计算事实损失和反事实损失
@@ -815,7 +576,7 @@ class HyCoRecSystem(BaseSystem):
         # counterfactual 目标：尽量与原始预测相反。
         loss_cf = self.counterfactual_loss(scores_orig, scores_cf)
         self._debug_check_tensor('train_view_learner_step.loss_cf', loss_cf)
-        
+
         # 5. model_loss = rec_loss + λ_model * (α * loss_f + (1-α) * loss_cf)
         # 主任务交叉熵仍是核心，视图对比损失作为辅助约束。
         view_loss = self.view_alpha*loss_f + (1 - self.view_alpha)*loss_cf
@@ -826,11 +587,12 @@ class HyCoRecSystem(BaseSystem):
         # 6. 更新主模型
         # 使用系统已有的 backward 逻辑更新主模型参数。
         self.backward(model_loss)
-        
+        self._set_view_learner_requires_grad(True)
+
         # 记录指标
         self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss.item()))
         self.evaluator.optim_metrics.add("model_loss", AverageMetric(model_loss.item()))
-        self.evaluator.optim_metrics.add("main_loss_f", AverageMetric(loss_f.item()))    
+        self.evaluator.optim_metrics.add("main_loss_f", AverageMetric(loss_f.item()))
         self.evaluator.optim_metrics.add("main_loss_cf", AverageMetric(loss_cf.item()))
 
     def train_conversation(self):

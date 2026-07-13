@@ -39,30 +39,9 @@ from crslab.model.utils.modules.attention import SelfAttentionBatch, SelfAttenti
 from crslab.model.utils.modules.weighted_hypergraph_conv import WeightedHypergraphConv
 from crslab.model.utils.modules.transformer import TransformerEncoder
 from crslab.model.crs.hycorec.decoder import TransformerDecoderKG
+from crslab.model.utils.modules.viewlearner import ViewLearner
 
 from crslab.model.utils.debug import _numeric_debug_tensor, check
-
-
-def _scatter_mean(values: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
-    """Compute mean aggregation over the first dimension with scatter-add."""
-    # 输出张量的首维对应聚合后的 group 数量，后续维度保持与输入一致。
-    out_shape = (dim_size,) + tuple(values.shape[1:])
-    # 先创建零张量，后面通过 scatter_add 把同组元素累加进去。
-    out = values.new_zeros(out_shape)
-    # 为了适配高维特征，这里把一维 index 扩展到与 values 同形状。
-    expand_shape = (index.size(0),) + (1,) * (values.dim() - 1)
-    # 按照 index 指定的 group 做加和。
-    out.scatter_add_(0, index.view(*expand_shape).expand_as(values), values)
-
-    # 统计每个 group 中有多少元素，后面用于求均值。
-    count = values.new_zeros(dim_size)
-    count.scatter_add_(0, index, values.new_ones(index.size(0)))
-    # 防止某个 group 为空导致除零。
-    count = count.clamp_min(1.0)
-    # 将计数 reshape 成可广播形状。
-    view_shape = (dim_size,) + (1,) * (values.dim() - 1)
-    # 返回按 group 聚合后的均值。
-    return out / count.view(*view_shape)
 
 class HyCoRecModel(BaseModel):
     """
@@ -104,6 +83,7 @@ class HyCoRecModel(BaseModel):
             side_data (dict): A dictionary record the side data.
 
         """
+        self.view_optim_opt = opt['view']
         self.device = device
         self.gpu = opt.get("gpu", -1)
         self.dataset = opt.get("dataset", None)
@@ -129,6 +109,12 @@ class HyCoRecModel(BaseModel):
         self.num_bases = opt.get('num_bases', 8)
         self.kg_emb_dim = opt.get('kg_emb_dim', 300)
         self.user_emb_dim = self.kg_emb_dim
+        self.hgcn_layers = int(opt.get('hgcn_layers', self.opt.get('hgcn_layers', 1)))
+        self.rgcn_layers = int(opt.get('rgcn_layers', self.opt.get('rgcn_layers', 1)))
+        if self.hgcn_layers <= 0:
+            raise ValueError(f'hgcn_layers must be positive, got {self.hgcn_layers}')
+        if self.rgcn_layers <= 0:
+            raise ValueError(f'rgcn_layers must be positive, got {self.rgcn_layers}')
         # transformer
         self.n_heads = opt.get('n_heads', 2)
         self.n_layers = opt.get('n_layers', 2)
@@ -151,6 +137,17 @@ class HyCoRecModel(BaseModel):
         self.pretrain = opt.get('pretrain', False)
         self.pretrain_data = None
         self.pretrain_epoch = opt.get('pretrain_epoch', 9999)
+        # view learner
+        self.keep_ratio = self.view_optim_opt.get('ratio', 0.6)  # 用于 early stop 的关键指标
+        self.cf_keep_ratio = self.view_optim_opt.get('cf_keep_ratio', 0.2)  # 反事实选边的保留比例
+        self.view_hidden_dim = self.view_optim_opt.get('view_hidden_dim', 64)  # ViewLearner 隐藏层维度
+        self.view_hyperedge_aggregation = self.view_optim_opt.get('hyperedge_aggregation', 'mean')
+        self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
+
+        # layers confige
+        self.graph_norm = str(opt.get('graph_norm', self.view_optim_opt.get('graph_norm', 'layernorm'))).lower()
+        self.graph_activation = str(opt.get('graph_activation', self.view_optim_opt.get('graph_activation', 'relu'))).lower()
+        self.graph_dropout = float(opt.get('graph_dropout', self.view_optim_opt.get('graph_dropout', self.dropout)))
 
         super(HyCoRecModel, self).__init__(opt, device)
         return
@@ -171,6 +168,7 @@ class HyCoRecModel(BaseModel):
 
     # 构建 mask
     def _build_hredial_copy_mask(self):
+        """只允许 decoder 从 @ 开头的 token 中拷贝，屏蔽掉普通词汇的拷贝 logits。这保证了拷贝机制只复制实体名称，不会照搬对话中的普通词。"""
         token_filename = os.path.join(DATASET_PATH, "hredial", "nltk", "token2id.json")
         token_file = open(token_filename, 'r', encoding="utf-8")
         token2id = json.load(token_file)
@@ -266,18 +264,95 @@ class HyCoRecModel(BaseModel):
         logger.debug('[Build embedding]')
         return
 
+    def _build_rgcn_stack(self):
+        return nn.ModuleList([
+            RGCNConv(self.kg_emb_dim, self.kg_emb_dim, self.n_relation, num_bases=self.num_bases)
+            for _ in range(self.rgcn_layers)
+        ])
+
+    def _build_hgcn_stack(self):
+        return nn.ModuleList([
+            WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+            for _ in range(self.hgcn_layers)
+        ])
+
+    def _build_view_learner_stack(self):
+        return nn.ModuleList([
+            ViewLearner(
+                self.kg_emb_dim,
+                self.view_hidden_dim,
+                self.device,
+                hyperedge_aggregation=self.view_hyperedge_aggregation
+            )
+            for _ in range(self.hgcn_layers)
+        ])
+
+    def _make_graph_norm(self):
+        if self.graph_norm in {'layernorm', 'layer_norm', 'ln'}:
+            return nn.LayerNorm(self.kg_emb_dim)
+        if self.graph_norm in {'batchnorm', 'batch_norm', 'bn'}:
+            return nn.BatchNorm1d(self.kg_emb_dim)
+        if self.graph_norm in {'none', 'identity', ''}:
+            return nn.Identity()
+        raise ValueError(f'Unsupported graph_norm: {self.graph_norm}')
+
+    def _build_graph_transitions(self, num_layers):
+        transition_layers = max(num_layers - 1, 0)
+        norms = nn.ModuleList([self._make_graph_norm() for _ in range(transition_layers)])
+        dropouts = nn.ModuleList([nn.Dropout(self.graph_dropout) for _ in range(transition_layers)])
+        return norms, dropouts
+
+    def _graph_activate(self, x):
+        if self.graph_activation == 'relu':
+            return F.relu(x)
+        if self.graph_activation == 'gelu':
+            return F.gelu(x)
+        if self.graph_activation in {'none', 'identity', ''}:
+            return x
+        raise ValueError(f'Unsupported graph_activation: {self.graph_activation}')
+
+    def _apply_graph_transition(self, x, norms, dropouts, layer_idx):
+        if layer_idx >= len(norms):
+            return x
+        x = norms[layer_idx](x)
+        x = self._graph_activate(x)
+        x = dropouts[layer_idx](x)
+        return x
+
+    def _run_rgcn_stack(self, node_embedding, encoders, norms, dropouts):
+        out = node_embedding
+        for layer_idx, encoder in enumerate(encoders):
+            out = encoder(out, self.edge_idx, self.edge_type)
+            out = self._apply_graph_transition(out, norms, dropouts, layer_idx)
+        return out
+
     # 构建超图编码层
     def _build_kg_layer(self):
         # graph encoder
-        self.item_encoder = RGCNConv(self.kg_emb_dim, self.kg_emb_dim, self.n_relation, num_bases=self.num_bases)
-        self.entity_encoder = RGCNConv(self.kg_emb_dim, self.kg_emb_dim, self.n_relation, num_bases=self.num_bases)
-        self.word_encoder = RGCNConv(self.kg_emb_dim, self.kg_emb_dim, self.n_relation, num_bases=self.num_bases)
+        self.item_encoder = self._build_rgcn_stack()
+        self.entity_encoder = self._build_rgcn_stack()
+        self.word_encoder = self._build_rgcn_stack()
+        self.item_encoder_norms, self.item_encoder_dropouts = self._build_graph_transitions(self.rgcn_layers)
+        self.entity_encoder_norms, self.entity_encoder_dropouts = self._build_graph_transitions(self.rgcn_layers)
+        self.word_encoder_norms, self.word_encoder_dropouts = self._build_graph_transitions(self.rgcn_layers)
         if self.pretrain:
-            self.item_encoder.load_state_dict(self.pretrain_data['encoder'])
+            self.item_encoder[0].load_state_dict(self.pretrain_data['encoder'])
         # hypergraph convolution
-        self.hyper_conv_item = WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        self.hyper_conv_entity = WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        self.hyper_conv_word = WeightedHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+        self.hyper_conv_item = self._build_hgcn_stack()
+        self.hyper_conv_entity = self._build_hgcn_stack()
+        self.hyper_conv_word = self._build_hgcn_stack()
+        self.hyper_conv_item_norms, self.hyper_conv_item_dropouts = self._build_graph_transitions(self.hgcn_layers)
+        self.hyper_conv_entity_norms, self.hyper_conv_entity_dropouts = self._build_graph_transitions(self.hgcn_layers)
+        self.hyper_conv_word_norms, self.hyper_conv_word_dropouts = self._build_graph_transitions(self.hgcn_layers)
+        if self.same_view:
+            shared_view_learner = self._build_view_learner_stack()
+            self.view_learner_item = shared_view_learner
+            self.view_learner_entity = shared_view_learner
+            self.view_learner_word = shared_view_learner
+        else:
+            self.view_learner_item = self._build_view_learner_stack()
+            self.view_learner_entity = self._build_view_learner_stack()
+            self.view_learner_word = self._build_view_learner_stack()
         # attention type
         self.item_attn = MHItemAttention(self.kg_emb_dim, self.mha_n_heads)
         # pooling
@@ -373,7 +448,7 @@ class HyCoRecModel(BaseModel):
         return list(set(hypergraph_nodes)), hyper_edge_index
 
     # 获取聚合
-    def _get_embedding(self, hypergraph_items, embedding, tot_sub, adj):
+    def _agg_embding(self, hypergraph_items, embedding, tot_sub, adj):
         knowledge_embedding_list = []
         for item in hypergraph_items:
             sub_graph = [item] + list(adj.get(item, []))
@@ -404,10 +479,13 @@ class HyCoRecModel(BaseModel):
                 assert self.pooling == 'Mean'
                 user_repr = torch.mean(related_embedding, dim=0)
         elif self.pooling == 'Attn':
+            # 保留与context相关度高的related embd
             attentive_related_embedding = self.item_attn(related_embedding, context_embedding)
+            # 自注意力aggragation
             user_repr = self.kg_attn_his(attentive_related_embedding)
             user_repr = torch.unsqueeze(user_repr, dim=0)
             user_repr = torch.cat((context_embedding, user_repr), dim=0)
+            # 再融合一次context
             user_repr = self.kg_attn(user_repr)
         else:
             assert self.pooling == 'Mean'
@@ -432,10 +510,30 @@ class HyCoRecModel(BaseModel):
         hllm_hyper_edge = [[sub_item2id[item] for item in hllm_hyper_edge_A], hllm_hyper_edge_B]
         hllm_hyper_edge = torch.LongTensor(hllm_hyper_edge).to(self.device)
 
-        embedding = conv(sub_embedding, hllm_hyper_edge)
+        graph_data = {
+            'node_embedding': sub_embedding,
+            'hyper_edge_index': hllm_hyper_edge,
+            'num_hyperedges': len(hllm_hyper_graph)
+        }
+        embedding = self._run_hypergraph_conv(graph_data, conv)
 
         return embedding
-    
+    def process_hllm(self, hllm_data, id_dict):
+        res_data = []
+        for raw_hyper_grapth in hllm_data:
+            if not isinstance(raw_hyper_grapth, list):
+                continue
+            temp_hyper_grapth = []
+            for meta_data in raw_hyper_grapth:
+                if not isinstance(meta_data, int):
+                    continue
+                if meta_data not in id_dict:
+                    continue
+                temp_hyper_grapth.append(id_dict[meta_data])
+            res_data.append(temp_hyper_grapth)
+        return res_data
+
+    # old_version
     def encode_user_repr(self, related_items, related_entities, related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding,):
         # COLD START
         # if len(related_items) == 0 or len(related_words) == 0:
@@ -451,27 +549,21 @@ class HyCoRecModel(BaseModel):
         #     return user_repr
         
         # 获取超图后的数据
-        item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_items) > 0:
-            items, item_hyper_edge_index = self._get_hypergraph(related_items, self.item_adj)
-            sub_item_embedding, sub_item_edge_index, item_tot2sub = self._before_hyperconv(tot_item_embedding, items, item_hyper_edge_index, self.item_adj)
-            # 传入 hyperedge_weight 进行有权重的消息传播
-            raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index)
-            item_embedding = raw_item_embedding
-
-        entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_entities) > 0:
-            entities, entity_hyper_edge_index = self._get_hypergraph(related_entities, self.entity_adj)
-            sub_entity_embedding, sub_entity_edge_index, entity_tot2sub = self._before_hyperconv(tot_entity_embedding, entities, entity_hyper_edge_index, self.entity_adj)
-            raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index)
-            entity_embedding = raw_entity_embedding
-            
-        word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_words) > 0:
-            words, word_hyper_edge_index = self._get_hypergraph(related_words, self.word_adj)
-            sub_word_embedding, sub_word_edge_index, word_tot2sub = self._before_hyperconv(tot_word_embedding, words, word_hyper_edge_index, self.word_adj)
-            raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index)
-            word_embedding = raw_word_embedding
+        item_embedding = self._run_hypergraph_conv(
+            self._prepare_single_hypergraph(related_items, tot_item_embedding, self.item_adj),
+            self.hyper_conv_item,
+            graph_key='item'
+        )
+        entity_embedding = self._run_hypergraph_conv(
+            self._prepare_single_hypergraph(related_entities, tot_entity_embedding, self.entity_adj),
+            self.hyper_conv_entity,
+            graph_key='entity'
+        )
+        word_embedding = self._run_hypergraph_conv(
+            self._prepare_single_hypergraph(related_words, tot_word_embedding, self.word_adj),
+            self.hyper_conv_word,
+            graph_key='word'
+        )
 
         # 注意力机制
         if len(related_entities) == 0:
@@ -480,21 +572,6 @@ class HyCoRecModel(BaseModel):
             context_embedding = tot_entity_embedding[related_entities]
             user_repr = self._attention_and_gating(item_embedding, entity_embedding, word_embedding, context_embedding)
         return user_repr
-    
-    def process_hllm(self, hllm_data, id_dict):
-        res_data = []
-        for raw_hyper_grapth in hllm_data:
-            if not isinstance(raw_hyper_grapth, list):
-                continue
-            temp_hyper_grapth = []
-            for meta_data in raw_hyper_grapth:
-                if not isinstance(meta_data, int):
-                    continue
-                if meta_data not in id_dict:
-                    continue
-                temp_hyper_grapth.append(id_dict[meta_data])
-            res_data.append(temp_hyper_grapth)
-        return res_data
 
     # 获取用户编码
     def encode_user(self, batch_related_items, batch_related_entities, batch_related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding):
@@ -515,9 +592,10 @@ class HyCoRecModel(BaseModel):
         related_entity = batch['related_entity']
         related_word = batch['related_word']
         item = batch['item']
-        item_embedding = self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        entity_embedding = self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)       
-        token_embedding = self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
+        kg_embeddings = self._encode_kg_embeddings()
+        item_embedding = kg_embeddings['item']
+        entity_embedding = kg_embeddings['entity']
+        token_embedding = kg_embeddings['word']
 
         # 获取用户编码
         # start = perf_counter()
@@ -538,12 +616,25 @@ class HyCoRecModel(BaseModel):
     def _encode_kg_embeddings(self):
         # 对三类节点分别做一次 RGCN 编码，得到整图级节点表示。
         kg_embeddings = {
-            'item': self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type),
-            'entity': self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type),
-            'word': self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
+            'item': self._run_rgcn_stack(
+                self.entity_embedding.weight,
+                self.item_encoder,
+                self.item_encoder_norms,
+                self.item_encoder_dropouts
+            ),
+            'entity': self._run_rgcn_stack(
+                self.entity_embedding.weight,
+                self.entity_encoder,
+                self.entity_encoder_norms,
+                self.entity_encoder_dropouts
+            ),
+            'word': self._run_rgcn_stack(
+                self.word_embedding.weight,
+                self.word_encoder,
+                self.word_encoder_norms,
+                self.word_encoder_dropouts
+            )
         }
-        for graph_key, embedding in kg_embeddings.items():
-            _numeric_debug_tensor(self, f'_encode_kg_embeddings.{graph_key}', embedding)
         return kg_embeddings
 
     def _prepare_single_hypergraph(self, related_nodes, total_embedding, adj):
@@ -553,13 +644,10 @@ class HyCoRecModel(BaseModel):
 
         # 先根据 related_nodes 和邻接表构造当前样本的超图。
         hypergraph_nodes, hyper_edge_index = self._get_hypergraph(related_nodes, adj)
-        # logger.info(f"hypergraph_nodes={hypergraph_nodes}, hyper_edge_index={hyper_edge_index}")
         # 再把整图 embedding 裁成当前样本子图所需的节点与边索引。
         sub_node_embedding, sub_edge_index, tot2sub = self._before_hyperconv(
             total_embedding, hypergraph_nodes, hyper_edge_index, adj
         )
-        # logger.info(f"sub_node_embedding_shape={sub_node_embedding}, sub_edge_index_shape={sub_edge_index}")
-        _numeric_debug_tensor(self, '_prepare_single_hypergraph.sub_node_embedding', sub_node_embedding)
 
         # 预先记录超边数量，避免后面重复从索引里计算。
         num_hyperedges = 0
@@ -641,32 +729,119 @@ class HyCoRecModel(BaseModel):
             'graphs': batch_graphs
         }
 
-    def _run_hypergraph_conv(self, graph_data, hyper_conv, hyperedge_weight=None):
+    def _hypergraph_transitions(self, graph_key):
+        if graph_key == 'item':
+            return self.hyper_conv_item_norms, self.hyper_conv_item_dropouts
+        if graph_key == 'entity':
+            return self.hyper_conv_entity_norms, self.hyper_conv_entity_dropouts
+        if graph_key == 'word':
+            return self.hyper_conv_word_norms, self.hyper_conv_word_dropouts
+        return (), ()
+
+    @staticmethod
+    def _copy_sample_graph(sample_graph):
+        copied = {}
+        for key, value in sample_graph.items():
+            if key in {'item', 'entity', 'word'} and value is not None:
+                copied[key] = dict(value)
+            else:
+                copied[key] = value
+        return copied
+
+    @staticmethod
+    def _select_layer_weight(weight, layer_idx):
+        if weight is None:
+            return None
+        if isinstance(weight, (list, tuple)):
+            if layer_idx >= len(weight):
+                return None
+            return weight[layer_idx]
+        return weight
+
+    @staticmethod
+    def _update_graph_embedding(sample_graph, graph_key, embedding):
+        if sample_graph.get(graph_key) is None:
+            return
+        sample_graph[graph_key]['node_embedding'] = embedding
+
+    def _run_hypergraph_view_layer(self, working_graph, layer_weights, layer_idx):
+        layer_weights = layer_weights or {}
+        item_embedding = self._run_hypergraph_conv(
+            working_graph['item'],
+            self.hyper_conv_item,
+            layer_weights.get('item'),
+            layer_idx=layer_idx,
+            graph_key='item'
+        )
+        entity_embedding = self._run_hypergraph_conv(
+            working_graph['entity'],
+            self.hyper_conv_entity,
+            layer_weights.get('entity'),
+            layer_idx=layer_idx,
+            graph_key='entity'
+        )
+        word_embedding = self._run_hypergraph_conv(
+            working_graph['word'],
+            self.hyper_conv_word,
+            layer_weights.get('word'),
+            layer_idx=layer_idx,
+            graph_key='word'
+        )
+
+        self._update_graph_embedding(working_graph, 'item', item_embedding)
+        self._update_graph_embedding(working_graph, 'entity', entity_embedding)
+        self._update_graph_embedding(working_graph, 'word', word_embedding)
+        return item_embedding, entity_embedding, word_embedding
+
+    def _run_hypergraph_conv(self, graph_data, hyper_conv, hyperedge_weight=None,
+                             layer_idx=None, graph_key=None):
         # 缺失图时返回零向量，保持后续拼接逻辑稳定。
         if graph_data is None:
             return torch.zeros((1, self.kg_emb_dim), device=self.device)
-        # 否则对当前样本子图执行一次 HGCN，可选传入超边权重。
-        _numeric_debug_tensor(self, '_run_hypergraph_conv.node_embedding_input', graph_data['node_embedding'])
-        _numeric_debug_tensor(self, '_run_hypergraph_conv.hyperedge_weight_input', hyperedge_weight)
-        # if hyperedge_weight is not None:
-            # logger.info(f"weight_shape={hyperedge_weight.shape},incidence_shape={graph_data['hyper_edge_index'].shape}")
-            # weight = hyperedge_weight.view(-1).to(self.device)
-            # logger.info(f"weight_shape={weight.shape},numl={int(graph_data['hyper_edge_index'][1].max()) + 1}")
-            # logger.info(f"node_index={graph_data['hyper_edge_index'][0]},edge_index={graph_data['hyper_edge_index'][1]}")
-            # logger.info(f"weight={hyperedge_weight}")
+
+        norms, dropouts = self._hypergraph_transitions(graph_key)
+        if isinstance(hyper_conv, nn.ModuleList):
+            # 原hycorec多层HGCN路径
+            if layer_idx is None:
+                out = graph_data['node_embedding']
+                local_graph = dict(graph_data)
+                for current_layer, conv in enumerate(hyper_conv):
+                    layer_weight = self._select_layer_weight(hyperedge_weight, current_layer)
+                    out = conv(
+                        out,
+                        local_graph['hyper_edge_index'],
+                        incidence_weight=layer_weight
+                    )
+                    out = self._apply_graph_transition(out, norms, dropouts, current_layer)
+                    local_graph['node_embedding'] = out
+                return out
+
+            conv = hyper_conv[layer_idx]
+            layer_weight = self._select_layer_weight(hyperedge_weight, layer_idx)
+            out = conv(
+                graph_data['node_embedding'],
+                graph_data['hyper_edge_index'],
+                incidence_weight=layer_weight
+            )
+            return self._apply_graph_transition(out, norms, dropouts, layer_idx)
 
         out = hyper_conv(
             graph_data['node_embedding'],
             graph_data['hyper_edge_index'],
             incidence_weight=hyperedge_weight
         )
-        _numeric_debug_tensor(self, '_run_hypergraph_conv.output', out)
         return out
 
-    def encode_user_from_prepared_batch(self, prepared_batch, batch_item_weights=None,
-                                        batch_entity_weights=None, batch_word_weights=None):
-        # 逐样本构造最终用户表示，因为每个样本的子图结构都不同。
+    def encode_user_from_prepared_batch(self, prepared_batch,build_hyperedge_weights = False,
+                                        return_hyperedge_weights=False,
+                                        weight_stage='train'):
+        # 逐样本并行构造原图、事实图、反事实图三种用户表示。
         user_repr_list = []
+        f_user_repr_list = []
+        cf_user_repr_list = []
+        generated_weights = {'item': [], 'entity': [], 'word': []}
+        generated_cf_weights = {'item': [], 'entity': [], 'word': []}
+        case_study_topo = []
 
         for idx, sample_graph in enumerate(prepared_batch['graphs']):
             #cold-start
@@ -674,19 +849,66 @@ class HyCoRecModel(BaseModel):
             #     user_repr_list.append(sample_graph['user_repr'])
             #     continue
 
-            # 逐样本取出三类图的超边权重；若无权版本则为 None。
-            item_weight = batch_item_weights[idx] if batch_item_weights is not None else None
-            entity_weight = batch_entity_weights[idx] if batch_entity_weights is not None else None
-            word_weight = batch_word_weights[idx] if batch_word_weights is not None else None
-            # item/entity/word 三类子图各自执行带权或不带权的 HGCN。
-            # print(f"[BEFORE HGCN] {torch.cuda.memory_allocated()/1e9:.2f} GB")
-            item_embedding = self._run_hypergraph_conv(sample_graph['item'], self.hyper_conv_item, item_weight)
-            entity_embedding = self._run_hypergraph_conv(sample_graph['entity'], self.hyper_conv_entity, entity_weight)
-            word_embedding = self._run_hypergraph_conv(sample_graph['word'], self.hyper_conv_word, word_weight)
-            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].item_embedding', item_embedding)
-            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].entity_embedding', entity_embedding)
-            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].word_embedding', word_embedding)
-            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].context_embedding', sample_graph['context_embedding'])
+            origin_graph = self._copy_sample_graph(sample_graph)
+            item_embedding = entity_embedding = word_embedding = None
+            if build_hyperedge_weights:
+                factual_graph = self._copy_sample_graph(sample_graph)
+                counterfactual_graph = self._copy_sample_graph(sample_graph)
+                sample_generated_weights = {'item': [], 'entity': [], 'word': []}
+                sample_generated_cf_weights = {'item': [], 'entity': [], 'word': []}
+                sample_f_topo_layers = []
+                sample_cf_topo_layers = []
+                f_item_embedding = f_entity_embedding = f_word_embedding = None
+                cf_item_embedding = cf_entity_embedding = cf_word_embedding = None
+
+            for layer_idx in range(self.hgcn_layers):
+                item_embedding, entity_embedding, word_embedding = self._run_hypergraph_view_layer(
+                    origin_graph,
+                    None,
+                    layer_idx
+                )
+                if build_hyperedge_weights:
+                    layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
+                        factual_graph,
+                        i=layer_idx,
+                        stage=weight_stage
+                    )
+                    for graph_key in ('item', 'entity', 'word'):
+                        sample_generated_weights[graph_key].append(layer_f_weights[graph_key])
+                    sample_f_topo_layers.append(layer_f_topo)
+                    f_item_embedding, f_entity_embedding, f_word_embedding = self._run_hypergraph_view_layer(
+                        factual_graph,
+                        layer_f_weights,
+                        layer_idx
+                    )
+
+                    _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
+                        counterfactual_graph,
+                        i=layer_idx,
+                        stage=weight_stage
+                    )
+                    for graph_key in ('item', 'entity', 'word'):
+                        sample_generated_cf_weights[graph_key].append(layer_cf_weights[graph_key])
+                    sample_cf_topo_layers.append(layer_cf_topo)
+                    cf_item_embedding, cf_entity_embedding, cf_word_embedding = self._run_hypergraph_view_layer(
+                        counterfactual_graph,
+                        layer_cf_weights,
+                        layer_idx
+                    )
+
+            if build_hyperedge_weights:
+                for graph_key in ('item', 'entity', 'word'):
+                    generated_weights[graph_key].append(sample_generated_weights[graph_key])
+                    generated_cf_weights[graph_key].append(sample_generated_cf_weights[graph_key])
+
+                if len(sample_f_topo_layers) == 0:
+                    case_study_topo.append({})
+                else:
+                    sample_topo = dict(sample_f_topo_layers[-1])
+                    sample_topo['f_layers'] = sample_f_topo_layers
+                    sample_topo['cf_layers'] = sample_cf_topo_layers
+                    case_study_topo.append(sample_topo)
+
             # print(f"[After HGCN] {torch.cuda.memory_allocated()/1e9:.2f} GB")            
             # 将三路子图表示和上下文表示融合成单个用户向量。
             user_repr = self._attention_and_gating(
@@ -695,35 +917,46 @@ class HyCoRecModel(BaseModel):
                 word_embedding,
                 sample_graph['context_embedding']
             )
-            _numeric_debug_tensor(self, f'encode_user_from_prepared_batch[{idx}].user_repr', user_repr)
-            # 收集 batch 内所有样本的用户表示。
             user_repr_list.append(user_repr)
+
+            if build_hyperedge_weights:
+                f_user_repr = self._attention_and_gating(
+                    f_item_embedding,
+                    f_entity_embedding,
+                    f_word_embedding,
+                    sample_graph['context_embedding']
+                )
+                cf_user_repr = self._attention_and_gating(
+                    cf_item_embedding,
+                    cf_entity_embedding,
+                    cf_word_embedding,
+                    sample_graph['context_embedding']
+                )
+                f_user_repr_list.append(f_user_repr)
+                cf_user_repr_list.append(cf_user_repr)
+
+
 
         # 堆叠成标准 batch 形状。
         user_embedding = torch.stack(user_repr_list, dim=0)
-        _numeric_debug_tensor(self, 'encode_user_from_prepared_batch.user_embedding', user_embedding)
-        return user_embedding
+        f_user_embedding = cf_user_embedding = None
+        if build_hyperedge_weights:
+            f_user_embedding = torch.stack(f_user_repr_list, dim=0)
+            cf_user_embedding = torch.stack(cf_user_repr_list, dim=0)
+            self._last_case_study_topo = case_study_topo
+        if return_hyperedge_weights:
+            return user_embedding, f_user_embedding, cf_user_embedding, generated_weights, generated_cf_weights
+        return user_embedding, f_user_embedding, cf_user_embedding
 
-    def recommend_from_prepared_batch(self, prepared_batch, batch_item_weights=None,
-                                      batch_entity_weights=None, batch_word_weights=None):
-        # 先基于已准备子图得到 batch 用户表示。
-        user_embedding = self.encode_user_from_prepared_batch(
-            prepared_batch,
-            batch_item_weights=batch_item_weights,
-            batch_entity_weights=batch_entity_weights,
-            batch_word_weights=batch_word_weights
-        )
-        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.user_embedding', user_embedding)
+    def recommend_from_prepared_batch(self, prepared_batch,
+                                      build_hyperedge_weights=False):
+        # 先基于已准备子图得到原图、事实图、反事实图三种 batch 用户表示。
+        user_embedding, f_user_embedding, cf_user_embedding = self.encode_user_from_prepared_batch(prepared_batch,build_hyperedge_weights = build_hyperedge_weights)
         # 推荐打分始终与 entity 编码后的整图实体向量做线性匹配。
         entity_embedding = prepared_batch['kg_embeddings']['entity']
-        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.entity_embedding', entity_embedding)
-        scores = F.linear(user_embedding, entity_embedding, self.rec_bias.bias)
-        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.scores', scores)
-        # 交叉熵损失仍使用原始 item 标签监督。
 
         # 1. 只保留 item 列（与 rec_evaluate 中的逻辑方向一致）
         item_ids_tensor = torch.tensor(self.item_ids, device=self.device, dtype=torch.long)
-        scores = scores[:, item_ids_tensor]  # (B, len_item_ids)
 
         # 2. 将 target 从全局 entity ID 映射为 item_ids 内的局部偏移
         #    与 rec_evaluate 中 self.item_ids.index(label) 逻辑完全一致
@@ -731,56 +964,24 @@ class HyCoRecModel(BaseModel):
         target_list = [item_to_idx[int(t.item())] for t in prepared_batch['item']]
         target_idx = torch.tensor(target_list, device=self.device)
 
-        loss = self.rec_loss(scores, target_idx)
-        _numeric_debug_tensor(self, 'recommend_from_prepared_batch.loss', loss)
+        def score_loss_rank(current_user_embedding):
+            scores = F.linear(current_user_embedding, entity_embedding, self.rec_bias.bias)
+            scores = scores[:, item_ids_tensor]  # (B, len_item_ids)
+            loss = self.rec_loss(scores, target_idx)
+            rank = (
+                scores.detach().argsort(dim=-1, descending=True) == target_idx.unsqueeze(1)
+            ).float().argmax(dim=-1)
+            return loss, scores, rank
 
-        rank = (scores.detach().argsort(dim=-1, descending=True) == target_idx.unsqueeze(1)).float().argmax(dim=-1)
-        return loss, scores, target_idx,rank
+        loss, scores, rank = score_loss_rank(user_embedding)
+        if build_hyperedge_weights:
+            f_loss, f_scores, f_rank = score_loss_rank(f_user_embedding)
+            cf_loss, cf_scores, cf_rank = score_loss_rank(cf_user_embedding)
+        else:
+            f_loss = f_scores = f_rank = None
+            cf_loss = cf_scores = cf_rank = None
+        return loss, scores, target_idx, rank, f_loss, f_scores, f_rank, cf_loss, cf_scores, cf_rank
     
-    def build_batch_hyperedge_weights(self, prepared_batch, item_weight_fn=None,
-                                      entity_weight_fn=None, word_weight_fn=None):
-        # 保存每个样本、每类图的超边权重。
-        batch_weights = {'item': [], 'entity': [], 'word': []}
-        # 额外保存拍平后的权重，供外部做统一统计。
-        flat_weight_info = {'item': [], 'entity': [], 'word': []}
-
-        # 逐样本生成权重，适配可变大小子图。
-        for sample_graph in prepared_batch['graphs']:
-            # 三类图共用同一套接口，但权重函数各自独立。
-            for graph_key, weight_fn in (
-                ('item', item_weight_fn),
-                ('entity', entity_weight_fn),
-                ('word', word_weight_fn)
-            ):
-                # 取出当前样本当前图类型的子图。
-                graph_data = sample_graph[graph_key]
-                # 无图或未提供权重函数时，表示该分支不启用权重。
-                if graph_data is None or weight_fn is None:
-                    batch_weights[graph_key].append(None)
-                    continue
-
-                # 先生成连接级权重。
-                connection_weight, _ = weight_fn(
-                    graph_data['node_embedding'],
-                    graph_data['hyper_edge_index']
-                )
-                # 保存逐样本超边权重。
-                batch_weights[graph_key].append(connection_weight)
-                # 也保存展平版本供统计使用。
-                flat_weight_info[graph_key].append(connection_weight.reshape(-1))
-
-        # 将拍平后的列表转成张量字典。
-        weight_info = {}
-        for graph_key, weights in flat_weight_info.items():
-            # 若某一图类型在当前 batch 中不存在，则返回零张量避免空列表问题。
-            if len(weights) == 0:
-                weight_info[graph_key] = torch.zeros(1, device=self.device)
-            else:
-                # 否则直接拼接所有样本的权重。
-                weight_info[graph_key] = torch.cat(weights, dim=0)
-
-        return batch_weights, weight_info
-
     def _starts(self, batch_size):
         """Return bsz start tokens."""
         return self.START.detach().expand(batch_size, 1)
@@ -796,7 +997,7 @@ class HyCoRecModel(BaseModel):
             self.hyper_conv_entity,
             self.hyper_conv_word,
             self.item_attn,
-            self.rec_bias
+            self.rec_bias   
         ]
         if self.pooling == "Attn":
             freeze_models.append(self.kg_attn)
@@ -833,29 +1034,21 @@ class HyCoRecModel(BaseModel):
             #     continue
 
             # 获取超图后的数据
-            item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-            if len(session_related_items) > 0:
-                items, item_hyper_edge_index = self._get_hypergraph(session_related_items, self.item_adj)
-                sub_item_embedding, sub_item_edge_index, item_tot2sub = self._before_hyperconv(tot_item_embedding, items, item_hyper_edge_index, self.item_adj)
-                raw_item_embedding = self.hyper_conv_item(sub_item_embedding, sub_item_edge_index)
-                item_embedding = raw_item_embedding
-                # item_embedding = self._get_embedding(items, raw_item_embedding, item_tot2sub, self.item_adj)
-
-            entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-            if len(session_related_entities) > 0:
-                entities, entity_hyper_edge_index = self._get_hypergraph(session_related_entities, self.entity_adj)
-                sub_entity_embedding, sub_entity_edge_index, entity_tot2sub = self._before_hyperconv(tot_entity_embedding, entities, entity_hyper_edge_index, self.entity_adj)
-                raw_entity_embedding = self.hyper_conv_entity(sub_entity_embedding, sub_entity_edge_index)
-                entity_embedding = raw_entity_embedding
-                # entity_embedding = self._get_embedding(entities, raw_entity_embedding, entity_tot2sub, self.entity_adj)
-                
-            word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-            if len(session_related_words) > 0:
-                owrds, word_hyper_edge_index = self._get_hypergraph(session_related_words, self.word_adj)
-                sub_word_embedding, sub_word_edge_index, word_tot2sub = self._before_hyperconv(tot_word_embedding, owrds, word_hyper_edge_index, self.word_adj)
-                raw_word_embedding = self.hyper_conv_word(sub_word_embedding, sub_word_edge_index)
-                word_embedding = raw_word_embedding
-                # word_embedding = self._get_embedding(owrds, raw_word_embedding, word_tot2sub, self.word_adj)
+            item_embedding = self._run_hypergraph_conv(
+                self._prepare_single_hypergraph(session_related_items, tot_item_embedding, self.item_adj),
+                self.hyper_conv_item,
+                graph_key='item'
+            )
+            entity_embedding = self._run_hypergraph_conv(
+                self._prepare_single_hypergraph(session_related_entities, tot_entity_embedding, self.entity_adj),
+                self.hyper_conv_entity,
+                graph_key='entity'
+            )
+            word_embedding = self._run_hypergraph_conv(
+                self._prepare_single_hypergraph(session_related_words, tot_word_embedding, self.word_adj),
+                self.hyper_conv_word,
+                graph_key='word'
+            )
 
             # 数据拼接
             if len(session_related_entities) == 0:
@@ -945,9 +1138,10 @@ class HyCoRecModel(BaseModel):
         related_tokens = batch['related_tokens']
         context_tokens = batch['context_tokens']
 
-        item_embedding = self.item_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        entity_embedding = self.entity_encoder(self.entity_embedding.weight, self.edge_idx, self.edge_type)
-        token_embedding = self.word_encoder(self.word_embedding.weight, self.edge_idx, self.edge_type)
+        kg_embeddings = self._encode_kg_embeddings()
+        item_embedding = kg_embeddings['item']
+        entity_embedding = kg_embeddings['entity']
+        token_embedding = kg_embeddings['word']
 
         # 获取对话编码
         session_state = self.encode_session(
@@ -997,159 +1191,229 @@ class HyCoRecModel(BaseModel):
             res = self.recommend(batch, mode)
             # print(f"{perf_counter() - start:.2f}")
             return res
+    @staticmethod
+    def gumbel_topk_select(weight, keep_ratio=0.9, mode='gumbel_topk'):
+        """
+        Args:
+            logits: 超边连接 logits。
+            keep_ratio: 目标保留比例，比如 0.3~0.6。
+            mode: 选边策略
+                - 'gumbel_topk': (默认) Gumbel 噪声 + top-k 选边，当前标准方法。
+                - 'random': 完全随机选边，forward 随机选 k 条边，
+                backward 仍通过直通估计传递 sigmoid(logits) 梯度。
+                用作 ablation baseline：验证 learned selection 是否优于随机。
+        
+        返回：硬选择的0/1权重 + 直通梯度估计。
+        """
+        k = max(1, int(len(weight) * keep_ratio))
 
+        if mode == 'random':
+            # 纯随机选边（ablation baseline）
+            # 随机打乱索引取前 k 个，完全不依赖 logits 排序
+            random_indices = torch.randperm(len(weight), device=weight.device)[:k]
 
-class HyperedgeAttentionPooling(nn.Module):
-    """CACHE-style PMA-inspired pooling from incident nodes to hyperedges."""
+            hinge = 1e-4
+            weights = torch.full_like(weight, hinge)
+            weights[random_indices] = 1.0 - hinge
+            # 直通梯度估计：forward 用随机硬值，backward 仍用 sigmoid(logits) 的梯度
+            soft_weights = torch.sigmoid(weight)
+            return weights + soft_weights - soft_weights.detach()
 
-    def __init__(self, input_dim, hidden_dim):
-        super(HyperedgeAttentionPooling, self).__init__()
-        # 保存输入维度，供后面创建参数和输出张量使用。
-        self.input_dim = input_dim
-        # 将节点特征映射到 attention key 空间。
-        self.key_proj = nn.Linear(input_dim, hidden_dim)
-        # 将节点特征映射到 value 空间，最终参与超边表示聚合。
-        self.value_proj = nn.Linear(input_dim, input_dim)
-        # 类似 PMA 中的 seed，作为每个超边共享的初始查询基底。
-        self.seed = nn.Parameter(torch.empty(1, input_dim))
-        # 全局可学习 query，用于衡量节点对超边表示的贡献度。
-        self.query = nn.Parameter(torch.empty(1, hidden_dim))
-        # 两层 LayerNorm 对应 attention 聚合后和 FFN 后的稳定化。
-        self.norm0 = nn.LayerNorm(input_dim)
-        self.norm1 = nn.LayerNorm(input_dim)
-        # 一个轻量 FFN，用于增强聚合后的超边表示。
-        self.ffn = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.ReLU(),
-            nn.Linear(input_dim, input_dim)
+        # --- 默认：Gumbel 噪声 + top-k 选边 ---
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(weight) + 1e-8) + 1e-8)
+        noisy_logits = weight + gumbel_noise
+        
+        _, top_indices = torch.topk(noisy_logits, k)
+        
+        # 硬选择：top-k 为 1-1e-4，其余为 1e-4
+        hinge = 1e-4
+        weights = torch.full_like(weight, hinge)
+        weights[top_indices] = 1.0 - hinge
+        # 直通梯度估计：forward用硬值，backward用 soft logits 的梯度(不用sigmoid也行)
+        soft_weights = torch.sigmoid(weight)
+        return weights + soft_weights - soft_weights.detach()
+        
+    @staticmethod
+    def counterfactual_topk_select(weight, keep_ratio=0.9, cf_keep_ratio=0.2):
+        """
+        对每个样本的每类图，按 logits 值从高到低分为三档：
+        - 前 cf_keep_ratio 高的连接 → 权重设为 hinge（抑制：ViewLearner 最认可的边）
+        - 中间 (keep_ratio - cf_keep_ratio) → 权重设为 1 - hinge（保留的核心信息边）
+        - 后 (1 - keep_ratio) 低的连接 → 权重设为 hinge（抑制：不重要的边）
+
+        即：仅保留 logits 排名中间段的连接，两端均抑制，构造结构化反事实视图。
+
+        直通梯度估计：forward 使用硬值，backward 梯度流经 sigmoid(logits)。
+
+        Args:
+            batch_logits: {'item': [tensor, ...], 'entity': [...], 'word': [...]}
+                        每个 tensor 是该样本该图类型所有连接的原始 logits（1D）。
+            keep_ratio: 中间+前段的总比例，即 top-keep_ratio 的 logits 参与分配。
+            cf_keep_ratio: 前段（最高 logits）比例，被抑制。
+
+        返回：
+            {'item': [tensor, ...], 'entity': [...], 'word': [...]}
+            与 batch_weights 结构相同的反事实权重字典。
+        """
+        hinge = 1e-4
+        n = len(weight)
+        top_k = max(1, int(n * cf_keep_ratio))
+        mid_k = max(1, int(n * keep_ratio))  # top_keep_ratio 的总数
+
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(weight) + 1e-8) + 1e-8)
+        noisy_logits = weight + gumbel_noise
+        # 按 logits 从高到低排序，取前 mid_k 个索引
+        _, sorted_indices = torch.topk(noisy_logits, mid_k)  # 前 mid_k 个（最高的）
+
+        # 中间 (mid_k - top_k) → 保留为 1 - hinge
+        mid_mask = torch.zeros_like(weight, dtype=torch.bool)
+        mid_mask[sorted_indices[top_k:]] = True
+        # mid_mask[sorted_indices[:top_k]] = True
+
+        # forward 权重：中间段 → 1-hinge，其余（前 top_k + 后段）→ hinge
+        forward_weights = torch.where(
+            mid_mask,
+            torch.full_like(weight, 1.0 - hinge),
+            torch.full_like(weight, hinge)
         )
-        # 显式初始化所有参数。
-        self.reset_parameters()
 
-    def reset_parameters(self):
-        # 线性层使用 Xavier 初始化，和项目内其他 MLP 保持一致。
-        nn.init.xavier_uniform_(self.key_proj.weight)
-        nn.init.xavier_uniform_(self.value_proj.weight)
-        nn.init.zeros_(self.key_proj.bias)
-        nn.init.zeros_(self.value_proj.bias)
-        # seed 和 query 也是可学习矩阵，同样采用 Xavier 初始化。
-        nn.init.xavier_uniform_(self.seed)
-        nn.init.xavier_uniform_(self.query)
-        # 归一化层重置为默认状态。
-        self.norm0.reset_parameters()
-        self.norm1.reset_parameters()
-        # FFN 内部线性层单独初始化。
-        for layer in self.ffn:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
+        # 直通梯度估计：backward 流经 sigmoid(logits)
+        soft_weights = torch.sigmoid(weight)
 
-    def forward(self, node_embedding, hyper_edge_index):
-        # 从 incidence 矩阵中取出“节点索引”和“超边索引”。
-        node_ids = hyper_edge_index[0]
-        hedge_ids = hyper_edge_index[1]
-        # 超边数量默认由索引最大值推断。
-        num_hyperedges = int(hedge_ids.max().item()) + 1
+        return forward_weights + soft_weights - soft_weights.detach()
+    
+    def _build_batch_hyperedge_weights(self, prepared_batch, stage='train'):
+        # batch_weights[graph_key][sample_idx][layer_idx] 直接对应多层 HGCN 的 incidence weights。
+        batch_weights = {'item': [], 'entity': [], 'word': []}
+        batch_cf_weights = {'item': [], 'entity': [], 'word': []}
+        case_study_topo = []
 
-        # 只取实际参与当前超边连接的节点表示。
-        node_repr = node_embedding[node_ids]
-        # 节点先映射到 key 空间，再与全局 query 做点积得到 attention logits。
-        attn_logits = (self.key_proj(node_repr) * self.query).sum(dim=-1)
-        # 标准缩放，避免 logits 过大。
-        attn_logits = attn_logits / math.sqrt(self.query.size(-1))
-        # 在同一条超边内部做 softmax，得到每个连接的注意力分数。
-        attn_scores = softmax(attn_logits, hedge_ids, num_nodes=num_hyperedges)
+        for sample_graph in prepared_batch['graphs']:
+            working_graph = self._copy_sample_graph(sample_graph)
+            sample_weights = {'item': [], 'entity': [], 'word': []}
+            sample_cf_weights = {'item': [], 'entity': [], 'word': []}
+            sample_topo_layers = []
 
-        # 为每条超边创建输出槽位。
-        hedge_embedding = node_embedding.new_zeros(num_hyperedges, self.input_dim)
-        # 将 value 按注意力加权后累加到对应超边上。
-        hedge_embedding.index_add_(
-            0,
-            hedge_ids,
-            self.value_proj(node_repr) * attn_scores.unsqueeze(-1)
-        )
+            for layer_idx in range(self.hgcn_layers):
+                layer_weights, layer_cf_weights, layer_topo = self._build_sample_hyperedge_weights(
+                    working_graph,
+                    layer_idx,
+                    stage=stage
+                )
+                sample_topo_layers.append(layer_topo)
 
-        # 加上 seed 后做第一层归一化，对齐 PMA 风格的残差结构。
-        hedge_embedding = self.norm0(hedge_embedding + self.seed)
-        # 再经过 FFN 和第二层归一化，增强超边表示能力。
-        hedge_embedding = self.norm1(hedge_embedding + self.ffn(hedge_embedding))
-        return hedge_embedding
+                for graph_key in ('item', 'entity', 'word'):
+                    sample_weights[graph_key].append(layer_weights[graph_key])
+                    sample_cf_weights[graph_key].append(layer_cf_weights[graph_key])
 
+                item_embedding = self._run_hypergraph_conv(
+                    working_graph['item'],
+                    self.hyper_conv_item,
+                    layer_weights['item'],
+                    layer_idx=layer_idx,
+                    graph_key='item'
+                )
+                entity_embedding = self._run_hypergraph_conv(
+                    working_graph['entity'],
+                    self.hyper_conv_entity,
+                    layer_weights['entity'],
+                    layer_idx=layer_idx,
+                    graph_key='entity'
+                )
+                word_embedding = self._run_hypergraph_conv(
+                    working_graph['word'],
+                    self.hyper_conv_word,
+                    layer_weights['word'],
+                    layer_idx=layer_idx,
+                    graph_key='word'
+                )
+                self._update_graph_embedding(working_graph, 'item', item_embedding)
+                self._update_graph_embedding(working_graph, 'entity', entity_embedding)
+                self._update_graph_embedding(working_graph, 'word', word_embedding)
 
-class ViewLearner(nn.Module):
-    """Learn connection logits from node-hyperedge pairs."""
+            for graph_key in ('item', 'entity', 'word'):
+                batch_weights[graph_key].append(sample_weights[graph_key])
+                batch_cf_weights[graph_key].append(sample_cf_weights[graph_key])
 
-    def __init__(self, input_dim, hidden_dim=64, device=None, hyperedge_aggregation='mean'):
-        super(ViewLearner, self).__init__()
+            if len(sample_topo_layers) == 0:
+                case_study_topo.append({})
+            else:
+                sample_topo = dict(sample_topo_layers[-1])
+                sample_topo['layers'] = sample_topo_layers
+                case_study_topo.append(sample_topo)
 
-        # 只允许两种超边表示方式，便于配置管理。
-        if hyperedge_aggregation not in {'mean', 'attention'}:
-            raise ValueError(f'Unsupported hyperedge_aggregation: {hyperedge_aggregation}')
+        self._last_case_study_topo = case_study_topo
+        return batch_weights, batch_cf_weights
 
-        # 记录基础配置。
-        self.input_dim = input_dim
-        self.device = device
-        self.hyperedge_aggregation = hyperedge_aggregation
+    def _build_sample_hyperedge_weights(self, sample_graph, i=0, stage='train'):
+        # 单样本、单层：根据当前 node_embedding 为 item/entity/word 三类超图各算一次权重。
+        sample_weights = {'item': None, 'entity': None, 'word': None}
+        sample_cf_weights = {'item': None, 'entity': None, 'word': None}
+        sample_topo = {}
 
-        # 独立 encoder 先对节点做一次超图编码，再交给边权预测头使用。
-        self.encoder = HypergraphConv(input_dim, input_dim)
-        # 边权头输入是“连接上的节点表示 + 对应超边表示”的拼接。
-        self.mlp_edge_model = nn.Sequential(
-            nn.Linear(input_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-        # 默认不启用 attention pooling，只有配置为 attention 时才创建模块。
-        self.attention_pool = None
-        if self.hyperedge_aggregation == 'attention':
-            self.attention_pool = HyperedgeAttentionPooling(input_dim, hidden_dim)
+        for graph_key, learner in self._view_learners(i).items():
+            graph_data = sample_graph[graph_key]
+            if graph_data is None:
+                sample_topo[graph_key] = {
+                    'nodes': [],
+                    'weights': [],
+                    'cf_weights': [],
+                    'hyper_edge_index': []
+                }
+                continue
 
-        # 初始化所有可学习参数。
-        self._init_weights()
+            weight_logits = learner(
+                graph_data['node_embedding'],
+                graph_data['hyper_edge_index']
+            )
+            f_weight = self.gumbel_topk_select(weight_logits, self.keep_ratio)
+            cf_weight = self.counterfactual_topk_select(
+                weight_logits,
+                self.keep_ratio,
+                self.cf_keep_ratio
+            )
+            sample_weights[graph_key] = f_weight
+            sample_cf_weights[graph_key] = cf_weight
+            sample_topo[graph_key] = self._format_sample_topology(
+                graph_data,
+                f_weight,
+                cf_weight
+            )
 
-    def _init_weights(self):
-        # 统一初始化当前模块下所有线性层。
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        return sample_weights, sample_cf_weights, sample_topo
 
-    def _aggregate_hyperedge_embedding(self, node_embedding, hyper_edge_index):
-        # incidence 矩阵第一行是节点，第二行是超边。
-        node_ids = hyper_edge_index[0]
-        hedge_ids = hyper_edge_index[1]
-        # 计算当前子图中的超边数量。
-        num_hyperedges = int(hedge_ids.max().item()) + 1
-        # 取出所有连接对应的节点表示，mean 聚合时会直接用到。
-        incident_node_embedding = node_embedding[node_ids]
+    def _format_sample_topology(self, graph_data, connection_weight, cf_weight):
+        edge_index = graph_data['hyper_edge_index']
+        tot2sub = graph_data.get('tot2sub', {})
+        sub2tot = {v: k for k, v in tot2sub.items()}
+        weight_np = connection_weight.detach().cpu().tolist()
+        cf_weight_np = cf_weight.detach().cpu().tolist()
+        edge_index_np = edge_index.detach().cpu().tolist()
+        num_edges = graph_data.get('num_hyperedges', 0)
 
-        # attention 模式下，使用 PMA 风格聚合得到超边表示。
-        if self.hyperedge_aggregation == 'attention':
-            return self.attention_pool(node_embedding, hyper_edge_index)
-        # mean 模式下，直接按超边对 incident 节点求均值。
-        return _scatter_mean(incident_node_embedding, hedge_ids, num_hyperedges)
+        topo_per_edge = [[] for _ in range(num_edges)]
+        weight_per_edge = [[] for _ in range(num_edges)]
+        cf_weight_per_edge = [[] for _ in range(num_edges)]
 
-    def forward(self, node_features, hyper_edge_index):
-        # 先用独立 HypergraphConv 对输入节点特征做一次编码。
-        _numeric_debug_tensor(self, 'ViewLearner.forward.node_features_input', node_features)
-        encoded_node_feat = self.encoder(node_features, hyper_edge_index)
-        # encoded_node_feat = node_features
-        _numeric_debug_tensor(self, 'ViewLearner.forward.encoded_node_feat', encoded_node_feat)
-        # 再按配置的聚合方式生成每条超边的表示。
-        hedge_embedding = self._aggregate_hyperedge_embedding(encoded_node_feat, hyper_edge_index)
-        _numeric_debug_tensor(self, 'ViewLearner.forward.hedge_embedding', hedge_embedding)
+        for conn_idx in range(len(weight_np)):
+            local_node = edge_index_np[0][conn_idx]
+            edge_id = edge_index_np[1][conn_idx]
+            global_node = sub2tot.get(local_node, local_node)
+            topo_per_edge[edge_id].append(global_node)
+            weight_per_edge[edge_id].append(weight_np[conn_idx])
+            cf_weight_per_edge[edge_id].append(cf_weight_np[conn_idx])
 
-        # 重新取出连接级的节点索引与超边索引。
-        node_ids = hyper_edge_index[0]
-        hedge_ids = hyper_edge_index[1]
-        # 对每条连接，拼接“该连接的节点表示”和“该连接所属超边表示”。
-        total_emb = torch.cat(
-            [encoded_node_feat[node_ids], hedge_embedding[hedge_ids]],
-            dim=1
-        )
-        _numeric_debug_tensor(self, 'ViewLearner.forward.total_emb', total_emb)
-        # 通过 MLP 输出每条连接的权重 logits，并展平成一维。
-        logits = self.mlp_edge_model(total_emb).reshape(-1)
-        _numeric_debug_tensor(self, 'ViewLearner.forward.logits', logits)
-        return logits
+        return {
+            'nodes': topo_per_edge,
+            'weights': weight_per_edge,
+            'cf_weights': cf_weight_per_edge,
+            'hyper_edge_index': edge_index_np
+        }
+    
+    def _view_learners(self, i):
+        # 统一返回三类超图对应的第 i 层 ViewLearner。
+        return {
+            'item': self.view_learner_item[i],
+            'entity': self.view_learner_entity[i],
+            'word': self.view_learner_word[i]
+        }
