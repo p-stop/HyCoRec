@@ -1,4 +1,4 @@
-from HyCoRec.crslab.model.utils.modules.attention import HyperedgeAttentionPooling
+from crslab.model.utils.modules.attention import HyperedgeAttentionPooling
 import torch
 from torch import nn
 from torch_geometric.nn import HypergraphConv

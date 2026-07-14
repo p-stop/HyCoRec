@@ -109,12 +109,9 @@ class HyCoRecModel(BaseModel):
         self.num_bases = opt.get('num_bases', 8)
         self.kg_emb_dim = opt.get('kg_emb_dim', 300)
         self.user_emb_dim = self.kg_emb_dim
-        self.hgcn_layers = int(opt.get('hgcn_layers', self.opt.get('hgcn_layers', 1)))
-        self.rgcn_layers = int(opt.get('rgcn_layers', self.opt.get('rgcn_layers', 1)))
-        if self.hgcn_layers <= 0:
-            raise ValueError(f'hgcn_layers must be positive, got {self.hgcn_layers}')
-        if self.rgcn_layers <= 0:
-            raise ValueError(f'rgcn_layers must be positive, got {self.rgcn_layers}')
+        self.hgcn_layers = opt.get('hgcn_layers', 1)
+        self.rgcn_layers = opt.get('rgcn_layers', 1)
+        self.cold_start = opt.get('cold_start', False)
         # transformer
         self.n_heads = opt.get('n_heads', 2)
         self.n_layers = opt.get('n_layers', 2)
@@ -145,9 +142,9 @@ class HyCoRecModel(BaseModel):
         self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
 
         # layers confige
-        self.graph_norm = str(opt.get('graph_norm', self.view_optim_opt.get('graph_norm', 'layernorm'))).lower()
-        self.graph_activation = str(opt.get('graph_activation', self.view_optim_opt.get('graph_activation', 'relu'))).lower()
-        self.graph_dropout = float(opt.get('graph_dropout', self.view_optim_opt.get('graph_dropout', self.dropout)))
+        self.graph_norm = opt.get('graph_norm', 'layernorm').lower()
+        self.graph_activation = opt.get('graph_activation', 'relu').lower()
+        self.graph_dropout = opt.get('graph_dropout', self.dropout)
 
         super(HyCoRecModel, self).__init__(opt, device)
         return
@@ -536,17 +533,18 @@ class HyCoRecModel(BaseModel):
     # old_version
     def encode_user_repr(self, related_items, related_entities, related_words, tot_item_embedding, tot_entity_embedding, tot_word_embedding,):
         # COLD START
-        # if len(related_items) == 0 or len(related_words) == 0:
-        #     if len(related_entities) == 0:
-        #         user_repr = torch.zeros(self.user_emb_dim, device=self.device)
-        #     elif self.pooling == 'Attn':
-        #         user_repr = tot_entity_embedding[related_entities]
-        #         user_repr = self.kg_attn(user_repr)
-        #     else:
-        #         assert self.pooling == 'Mean'
-        #         user_repr = tot_entity_embedding[related_entities]
-        #         user_repr = torch.mean(user_repr, dim=0)
-        #     return user_repr
+        if self.cold_start:
+            if len(related_items) == 0 or len(related_words) == 0:
+                if len(related_entities) == 0:
+                    user_repr = torch.zeros(self.user_emb_dim, device=self.device)
+                elif self.pooling == 'Attn':
+                    user_repr = tot_entity_embedding[related_entities]
+                    user_repr = self.kg_attn(user_repr)
+                else:
+                    assert self.pooling == 'Mean'
+                    user_repr = tot_entity_embedding[related_entities]
+                    user_repr = torch.mean(user_repr, dim=0)
+                return user_repr
         
         # 获取超图后的数据
         item_embedding = self._run_hypergraph_conv(
@@ -673,41 +671,42 @@ class HyCoRecModel(BaseModel):
         for related_item, related_entity, related_word in zip(
             batch['related_item'], batch['related_entity'], batch['related_word']
         ):
-            #cold-start
-            # if len(related_item) == 0 or len(related_word) == 0:
-            #     if len(related_entity) == 0:
-            #         batch_graphs.append({
-            #             'item': None,
-            #             'entity': None,
-            #             'word': None,
-            #             'context_embedding': None,
-            #             'cold-start': True,
-            #             'user_repr': torch.zeros(self.user_emb_dim, device=self.device)
-            #         })
-            #         continue
-            #     elif self.pooling == 'Attn':
-            #         context_embedding = kg_embeddings['entity'][related_entity]
-            #         batch_graphs.append({
-            #             'item': None,
-            #             'entity': None,
-            #             'word': None,
-            #             'context_embedding': context_embedding,
-            #             'cold-start': True,
-            #             'user_repr': self.kg_attn(context_embedding)
-            #         })
-            #         continue
-            #     else:
-            #         assert self.pooling == 'Mean'
-            #         context_embedding = kg_embeddings['entity'][related_entity]
-            #         batch_graphs.append({
-            #             'item': None,
-            #             'entity': None,
-            #             'word': None,
-            #             'context_embedding': context_embedding,
-            #             'cold-start': True,
-            #             'user_repr': torch.mean(context_embedding, dim=0)
-            #         })
-            #         continue
+            # cold-start
+            if self.cold_start:
+                if len(related_item) == 0 or len(related_word) == 0:
+                    if len(related_entity) == 0:
+                        batch_graphs.append({
+                            'item': None,
+                            'entity': None,
+                            'word': None,
+                            'context_embedding': None,
+                            'cold-start': True,
+                            'user_repr': torch.zeros(self.user_emb_dim, device=self.device)
+                        })
+                        continue
+                    elif self.pooling == 'Attn':
+                        context_embedding = kg_embeddings['entity'][related_entity]
+                        batch_graphs.append({
+                            'item': None,
+                            'entity': None,
+                            'word': None,
+                            'context_embedding': context_embedding,
+                            'cold-start': True,
+                            'user_repr': self.kg_attn(context_embedding)
+                        })
+                        continue
+                    else:
+                        assert self.pooling == 'Mean'
+                        context_embedding = kg_embeddings['entity'][related_entity]
+                        batch_graphs.append({
+                            'item': None,
+                            'entity': None,
+                            'word': None,
+                            'context_embedding': context_embedding,
+                            'cold-start': True,
+                            'user_repr': torch.mean(context_embedding, dim=0)
+                        })
+                        continue
             # related_entity 额外用于构造注意力融合时的上下文表示。
             context_embedding = None
             if len(related_entity) > 0:
@@ -833,7 +832,7 @@ class HyCoRecModel(BaseModel):
         return out
 
     def encode_user_from_prepared_batch(self, prepared_batch,build_hyperedge_weights = False,
-                                        return_hyperedge_weights=False,
+                                        return_hyperedge_weights=False,view_grad=False,
                                         weight_stage='train'):
         # 逐样本并行构造原图、事实图、反事实图三种用户表示。
         user_repr_list = []
@@ -845,9 +844,13 @@ class HyCoRecModel(BaseModel):
 
         for idx, sample_graph in enumerate(prepared_batch['graphs']):
             #cold-start
-            # if sample_graph.get('cold-start', False):
-            #     user_repr_list.append(sample_graph['user_repr'])
-            #     continue
+            if self.cold_start:
+                if sample_graph.get('cold-start', False):
+                    user_repr_list.append(sample_graph['user_repr'])
+                    if build_hyperedge_weights:
+                        f_user_repr_list.append(sample_graph['user_repr'])
+                        cf_user_repr_list.append(sample_graph['user_repr'])
+                    continue
 
             origin_graph = self._copy_sample_graph(sample_graph)
             item_embedding = entity_embedding = word_embedding = None
@@ -868,28 +871,43 @@ class HyCoRecModel(BaseModel):
                     layer_idx
                 )
                 if build_hyperedge_weights:
-                    layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
-                        factual_graph,
-                        i=layer_idx,
-                        stage=weight_stage
-                    )
+                    if view_grad == False:
+                        with torch.no_grad():
+                            layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
+                                factual_graph,
+                                i=layer_idx,
+                                stage=weight_stage
+                            )
+                            _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
+                                counterfactual_graph,
+                                i=layer_idx,
+                                stage=weight_stage
+                            )
+                    else:
+                        layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
+                            factual_graph,
+                            i=layer_idx,
+                            stage=weight_stage
+                        )
+                        _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
+                            counterfactual_graph,
+                            i=layer_idx,
+                            stage=weight_stage
+                        )
+
                     for graph_key in ('item', 'entity', 'word'):
                         sample_generated_weights[graph_key].append(layer_f_weights[graph_key])
                     sample_f_topo_layers.append(layer_f_topo)
+
+                    for graph_key in ('item', 'entity', 'word'):
+                        sample_generated_cf_weights[graph_key].append(layer_cf_weights[graph_key])
+                    sample_cf_topo_layers.append(layer_cf_topo)
+
                     f_item_embedding, f_entity_embedding, f_word_embedding = self._run_hypergraph_view_layer(
                         factual_graph,
                         layer_f_weights,
                         layer_idx
                     )
-
-                    _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
-                        counterfactual_graph,
-                        i=layer_idx,
-                        stage=weight_stage
-                    )
-                    for graph_key in ('item', 'entity', 'word'):
-                        sample_generated_cf_weights[graph_key].append(layer_cf_weights[graph_key])
-                    sample_cf_topo_layers.append(layer_cf_topo)
                     cf_item_embedding, cf_entity_embedding, cf_word_embedding = self._run_hypergraph_view_layer(
                         counterfactual_graph,
                         layer_cf_weights,
@@ -948,10 +966,10 @@ class HyCoRecModel(BaseModel):
             return user_embedding, f_user_embedding, cf_user_embedding, generated_weights, generated_cf_weights
         return user_embedding, f_user_embedding, cf_user_embedding
 
-    def recommend_from_prepared_batch(self, prepared_batch,
+    def recommend_from_prepared_batch(self, prepared_batch,view_grad = False,
                                       build_hyperedge_weights=False):
         # 先基于已准备子图得到原图、事实图、反事实图三种 batch 用户表示。
-        user_embedding, f_user_embedding, cf_user_embedding = self.encode_user_from_prepared_batch(prepared_batch,build_hyperedge_weights = build_hyperedge_weights)
+        user_embedding, f_user_embedding, cf_user_embedding = self.encode_user_from_prepared_batch(prepared_batch,build_hyperedge_weights = build_hyperedge_weights,view_grad = view_grad)
         # 推荐打分始终与 entity 编码后的整图实体向量做线性匹配。
         entity_embedding = prepared_batch['kg_embeddings']['entity']
 
@@ -1025,13 +1043,14 @@ class HyCoRecModel(BaseModel):
         session_repr_list = []
         for session_related_items, session_related_entities, session_related_words in zip(batch_related_items, batch_related_entities, batch_related_words):            
             # COLD START
-            # if len(session_related_items) == 0 or len(session_related_words) == 0:
-            #     if len(session_related_entities) == 0:
-            #         session_repr_list.append(None)
-            #     else:
-            #         session_repr = tot_entity_embedding[session_related_entities]
-            #         session_repr_list.append(session_repr)
-            #     continue
+            if self.cold_start:
+                if len(session_related_items) == 0 or len(session_related_words) == 0:
+                    if len(session_related_entities) == 0:
+                        session_repr_list.append(None)
+                    else:
+                        session_repr = tot_entity_embedding[session_related_entities]
+                        session_repr_list.append(session_repr)
+                    continue
 
             # 获取超图后的数据
             item_embedding = self._run_hypergraph_conv(

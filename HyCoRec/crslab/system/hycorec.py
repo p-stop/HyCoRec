@@ -77,12 +77,9 @@ class HyCoRecSystem(BaseSystem):
         self.view_lr = self.view_optim_opt.get('view_lr', 0.01)       # CACHE 默认 1e-2
         self.view_wd = self.view_optim_opt.get('view_wd', 0.001)      # CACHE 默认 1e-3
         self.view_alpha = self.view_optim_opt.get('view_alpha', 0.5)  # factual vs counterfactual 权重
-        self.view_lambda = self.view_optim_opt.get('view_lambda', 5.0)  # 边权重正则化系数
         self.model_lambda = self.view_optim_opt.get('model_lambda', 0.1)  # 主模型损失中的对比损失权重
         self.gamma = self.view_optim_opt.get('gamma', 0.5)            # hinge loss margin
-        self.temperature = self.view_optim_opt.get('temperature', 1.0)  # gumbel softmax 温度
         self.use_counterfactual = self.view_optim_opt.get('use_counterfactual', True)
-        self.tem_decay = self.view_optim_opt.get('tem_decay', False)  # 是否启用温度衰减（调试用）
         self.loss_tau = self.view_optim_opt.get('loss_tau', self.view_optim_opt.get('tau', 1.0))  # KL 蒸馏温度
         self.loss_topk = self.view_optim_opt.get('loss_topk', self.view_optim_opt.get('topk', 50))  # 排名损失使用的 top-k
         logger.info(f"loss_topk: {self.loss_topk}")
@@ -495,7 +492,8 @@ class HyCoRecSystem(BaseSystem):
             _, scores_cf, _
         ) = core_model.recommend_from_prepared_batch(
             prepared_batch,
-            build_hyperedge_weights=True
+            build_hyperedge_weights=True,
+            view_grad=True  # 允许 ViewLearner 梯度传播
         )
 
         # 5. 计算事实损失和反事实损失
