@@ -142,6 +142,15 @@ class HyCoRecModel(BaseModel):
         self.view_hyperedge_aggregation = self.view_optim_opt.get('hyperedge_aggregation', 'mean')
         self.same_view = self.view_optim_opt.get('same_view', False)  # 是否让事实视图和反事实视图共享权重学习器（调试用）
 
+        self.deitem_f = self.view_optim_opt.get('deitem_f', False)  # 是否在 ViewLearner 中去掉 item 图（调试用）
+        self.deentity_f = self.view_optim_opt.get('deentity_f', False)  # 是否在 ViewLearner 中去掉 entity 图（调试用）
+        self.deword_f = self.view_optim_opt.get('deword_f', False)  # 是否在 ViewLearner 中去掉 word 图（调试用）
+        self.deitem_cf = self.view_optim_opt.get('deitem_cf', False)  # 是否在 ViewLearner 中去掉 item 图（调试用）
+        self.deentity_cf = self.view_optim_opt.get('deentity_cf', False)  # 是否在 ViewLearner 中去掉 entity 图（调试用）
+        self.deword_cf = self.view_optim_opt.get('deword_cf', False)  # 是否在 ViewLearner 中去掉 word 图（调试用）
+        self.ablation_f_set = set()
+        self.ablation_cf_set = set()
+
         # layers confige
         self.graph_norm = opt.get('graph_norm', 'layernorm').lower()
         self.graph_activation = opt.get('graph_activation', 'relu').lower()
@@ -163,6 +172,19 @@ class HyCoRecModel(BaseModel):
         self._build_kg_layer()
         self._build_recommendation_layer()
         self._build_conversation_layer()
+
+        if self.deitem_f:
+            self.ablation_f_set.add('item')
+        if self.deentity_f:
+            self.ablation_f_set.add('entity')
+        if self.deword_f:
+            self.ablation_f_set.add('word')
+        if self.deitem_cf:
+            self.ablation_cf_set.add('item')
+        if self.deentity_cf:
+            self.ablation_cf_set.add('entity')
+        if self.deword_cf:
+            self.ablation_cf_set.add('word')
 
     # 构建 mask
     def _build_hredial_copy_mask(self):
@@ -878,23 +900,31 @@ class HyCoRecModel(BaseModel):
                                 layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
                                     factual_graph,
                                     i=layer_idx,
-                                    stage=weight_stage
-                                )
+                                    stage=weight_stage,
+                                    ablation_f_set=self.ablation_f_set,
+                                    ablation_cf_set=self.ablation_cf_set
+                                )   
                                 _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
                                     counterfactual_graph,
                                     i=layer_idx,
-                                    stage=weight_stage
+                                    stage=weight_stage,
+                                    ablation_cf_set=self.ablation_cf_set,
+                                    ablation_f_set=self.ablation_f_set
                                 )
                         else:
                             layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
                                 factual_graph,
                                 i=layer_idx,
-                                stage=weight_stage
+                                stage=weight_stage,
+                                ablation_f_set=self.ablation_f_set,
+                                ablation_cf_set=self.ablation_cf_set
                             )
                             _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
                                 counterfactual_graph,
                                 i=layer_idx,
-                                stage=weight_stage
+                                stage=weight_stage,
+                                ablation_cf_set=self.ablation_cf_set,
+                                ablation_f_set=self.ablation_f_set
                             )
                         for graph_key in ('item', 'entity', 'word'):
                             sample_generated_weights[graph_key].append(layer_f_weights[graph_key])
@@ -1320,7 +1350,9 @@ class HyCoRecModel(BaseModel):
                     layer_weights, layer_cf_weights, layer_topo = self._build_sample_hyperedge_weights(
                         working_graph,
                         layer_idx,
-                        stage=stage
+                        stage=stage,
+                        ablation_f_set=self.ablation_f_set,
+                        ablation_cf_set=self.ablation_cf_set
                     )
                     sample_topo_layers.append(layer_topo)
                 else:
@@ -1370,7 +1402,7 @@ class HyCoRecModel(BaseModel):
         self._last_case_study_topo = case_study_topo
         return batch_weights, batch_cf_weights
 
-    def _build_sample_hyperedge_weights(self, sample_graph, i=0, stage='train'):
+    def _build_sample_hyperedge_weights(self, sample_graph, i=0, stage='train',ablation_f_set = set(), ablation_cf_set = set()):
         # 单样本、单层：根据当前 node_embedding 为 item/entity/word 三类超图各算一次权重。
         sample_weights = {'item': None, 'entity': None, 'word': None}
         sample_cf_weights = {'item': None, 'entity': None, 'word': None}
@@ -1391,12 +1423,19 @@ class HyCoRecModel(BaseModel):
                 graph_data['node_embedding'],
                 graph_data['hyper_edge_index']
             )
-            f_weight = self.gumbel_topk_select(weight_logits, self.keep_ratio)
-            cf_weight = self.counterfactual_topk_select(
-                weight_logits,
-                self.keep_ratio,
-                self.cf_keep_ratio
-            )
+            if graph_key not in ablation_f_set:
+                f_weight = self.gumbel_topk_select(weight_logits, self.keep_ratio)
+            else:
+                f_weight = None
+
+            if graph_key not in ablation_cf_set:
+                cf_weight = self.counterfactual_topk_select(
+                    weight_logits,
+                    self.keep_ratio,
+                    self.cf_keep_ratio
+                )
+            else:
+                cf_weight = None
             sample_weights[graph_key] = f_weight
             sample_cf_weights[graph_key] = cf_weight
             sample_topo[graph_key] = self._format_sample_topology(
