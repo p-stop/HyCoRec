@@ -135,6 +135,7 @@ class HyCoRecModel(BaseModel):
         self.pretrain_data = None
         self.pretrain_epoch = opt.get('pretrain_epoch', 9999)
         # view learner
+        self.view_last = self.view_optim_opt.get('view_last', False)
         self.keep_ratio = self.view_optim_opt.get('ratio', 0.6)  # 用于 early stop 的关键指标
         self.cf_keep_ratio = self.view_optim_opt.get('cf_keep_ratio', 0.2)  # 反事实选边的保留比例
         self.view_hidden_dim = self.view_optim_opt.get('view_hidden_dim', 64)  # ViewLearner 隐藏层维度
@@ -281,7 +282,7 @@ class HyCoRecModel(BaseModel):
                 self.device,
                 hyperedge_aggregation=self.view_hyperedge_aggregation
             )
-            for _ in range(self.hgcn_layers)
+            for _ in range(1 if self.view_last else self.hgcn_layers)
         ])
 
     def _make_graph_norm(self):
@@ -871,8 +872,20 @@ class HyCoRecModel(BaseModel):
                     layer_idx
                 )
                 if build_hyperedge_weights:
-                    if view_grad == False:
-                        with torch.no_grad():
+                    if (not self.view_last) or layer_idx == self.hgcn_layers - 1:
+                        if view_grad == False:
+                            with torch.no_grad():
+                                layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
+                                    factual_graph,
+                                    i=layer_idx,
+                                    stage=weight_stage
+                                )
+                                _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
+                                    counterfactual_graph,
+                                    i=layer_idx,
+                                    stage=weight_stage
+                                )
+                        else:
                             layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
                                 factual_graph,
                                 i=layer_idx,
@@ -883,25 +896,14 @@ class HyCoRecModel(BaseModel):
                                 i=layer_idx,
                                 stage=weight_stage
                             )
+                        for graph_key in ('item', 'entity', 'word'):
+                            sample_generated_weights[graph_key].append(layer_f_weights[graph_key])
+                            sample_generated_cf_weights[graph_key].append(layer_cf_weights[graph_key])
+                        sample_f_topo_layers.append(layer_f_topo)
+                        sample_cf_topo_layers.append(layer_cf_topo)
                     else:
-                        layer_f_weights, _, layer_f_topo = self._build_sample_hyperedge_weights(
-                            factual_graph,
-                            i=layer_idx,
-                            stage=weight_stage
-                        )
-                        _, layer_cf_weights, layer_cf_topo = self._build_sample_hyperedge_weights(
-                            counterfactual_graph,
-                            i=layer_idx,
-                            stage=weight_stage
-                        )
-
-                    for graph_key in ('item', 'entity', 'word'):
-                        sample_generated_weights[graph_key].append(layer_f_weights[graph_key])
-                    sample_f_topo_layers.append(layer_f_topo)
-
-                    for graph_key in ('item', 'entity', 'word'):
-                        sample_generated_cf_weights[graph_key].append(layer_cf_weights[graph_key])
-                    sample_cf_topo_layers.append(layer_cf_topo)
+                        layer_f_weights = {'item': None, 'entity': None, 'word': None}
+                        layer_cf_weights = {'item': None, 'entity': None, 'word': None}
 
                     f_item_embedding, f_entity_embedding, f_word_embedding = self._run_hypergraph_view_layer(
                         factual_graph,
@@ -1314,12 +1316,16 @@ class HyCoRecModel(BaseModel):
             sample_topo_layers = []
 
             for layer_idx in range(self.hgcn_layers):
-                layer_weights, layer_cf_weights, layer_topo = self._build_sample_hyperedge_weights(
-                    working_graph,
-                    layer_idx,
-                    stage=stage
-                )
-                sample_topo_layers.append(layer_topo)
+                if (not self.view_last) or layer_idx == self.hgcn_layers - 1:
+                    layer_weights, layer_cf_weights, layer_topo = self._build_sample_hyperedge_weights(
+                        working_graph,
+                        layer_idx,
+                        stage=stage
+                    )
+                    sample_topo_layers.append(layer_topo)
+                else:
+                    layer_weights = {'item': None, 'entity': None, 'word': None}
+                    layer_cf_weights = {'item': None, 'entity': None, 'word': None}
 
                 for graph_key in ('item', 'entity', 'word'):
                     sample_weights[graph_key].append(layer_weights[graph_key])
@@ -1431,6 +1437,7 @@ class HyCoRecModel(BaseModel):
     
     def _view_learners(self, i):
         # 统一返回三类超图对应的第 i 层 ViewLearner。
+        i = 0 if self.view_last else i
         return {
             'item': self.view_learner_item[i],
             'entity': self.view_learner_entity[i],
