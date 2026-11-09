@@ -382,8 +382,9 @@ class HyCoRecSystem(BaseSystem):
                         batch[k] = v.to(self.device)
                 
                 if self.use_counterfactual:
+                    if not (self.deentity_cf and self.deword_cf and self.deitem_cf and self.deentity_f and self.deword_f and self.deitem_f):
                     # ========== STEP 1: 训练 ViewLearner ==========
-                    self.train_view_learner_step(batch,epoch)
+                        self.train_view_learner_step(batch,epoch)
                     
                     # ========== STEP 2: 训练主模型 ==========
                     self.train_main_model_step(batch,epoch)

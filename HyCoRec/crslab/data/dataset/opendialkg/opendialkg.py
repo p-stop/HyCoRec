@@ -262,7 +262,7 @@ class OpenDialKGDataset(BaseDataset):
         }
 
     def _word_kg_process(self):
-        edges = set()  # {(entity, entity)}
+        edge_list = []  # [(word, word, relation)]
         entities = set()
         for line in self.word_kg:
             triple = line.strip().split('\t')
@@ -270,10 +270,21 @@ class OpenDialKGDataset(BaseDataset):
             entities.add(triple[2])
             e0 = self.word2id[triple[0]]
             e1 = self.word2id[triple[2]]
-            edges.add((e0, e1))
-            edges.add((e1, e0))
-        # edge_set = [[co[0] for co in list(edges)], [co[1] for co in list(edges)]]
+            r = triple[1]
+            edge_list.append((e0, e1, r))
+            edge_list.append((e1, e0, r))
+            edge_list.append((e0, e0, 'SELF_LOOP'))
+            if e1 != e0:
+                edge_list.append((e1, e1, 'SELF_LOOP'))
+
+        relation2id, edges = dict(), set()
+        for h, t, r in edge_list:
+            if r not in relation2id:
+                relation2id[r] = len(relation2id)
+            edges.add((h, t, relation2id[r]))
+
         return {
             'edge': list(edges),
+            'n_relation': len(relation2id),
             'entity': list(entities)
         }

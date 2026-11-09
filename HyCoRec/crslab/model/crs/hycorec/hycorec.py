@@ -99,6 +99,11 @@ class HyCoRecModel(BaseModel):
         self.pretrain_embedding = side_data.get('embedding', None)
         self.token2id = json.load(open(os.path.join(DATASET_PATH, self.dataset.lower(), opt["tokenize"], "token2id.json"), "r", encoding="utf-8"))
         self.entity2id = json.load(open(os.path.join(DATASET_PATH, self.dataset.lower(), opt["tokenize"], "entity2id.json"), "r", encoding="utf-8"))
+        word2id_path = os.path.join(DATASET_PATH, self.dataset.lower(), opt["tokenize"], "word2id.json")
+        if not os.path.isfile(word2id_path):
+            word2id_path = os.path.join(DATASET_PATH, self.dataset.lower(), opt["tokenize"], "concept2id.json")
+        with open(word2id_path, "r", encoding="utf-8") as word2id_file:
+            self.word2id = json.load(word2id_file)
         # kg
         self.n_entity = vocab['n_entity']
         self.entity_kg = side_data['entity_kg']
@@ -106,6 +111,12 @@ class HyCoRecModel(BaseModel):
         self.edge_idx, self.edge_type = edge_to_pyg_format(self.entity_kg['edge'], 'RGCN')
         self.edge_idx = self.edge_idx.to(device)
         self.edge_type = self.edge_type.to(device)
+        self.n_word = vocab['n_word']
+        self.word_kg = side_data['word_kg']
+        self.word_n_relation = self.word_kg['n_relation']
+        self.word_edge_idx, self.word_edge_type = edge_to_pyg_format(self.word_kg['edge'], 'RGCN')
+        self.word_edge_idx = self.word_edge_idx.to(device)
+        self.word_edge_type = self.word_edge_type.to(device)
         self.num_bases = opt.get('num_bases', 8)
         self.kg_emb_dim = opt.get('kg_emb_dim', 300)
         self.user_emb_dim = self.kg_emb_dim
@@ -185,6 +196,7 @@ class HyCoRecModel(BaseModel):
             self.ablation_cf_set.add('entity')
         if self.deword_cf:
             self.ablation_cf_set.add('word')
+        logger.info(self.ablation_f_set)
 
     # 构建 mask
     def _build_hredial_copy_mask(self):
@@ -214,7 +226,7 @@ class HyCoRecModel(BaseModel):
     # 构建关联矩阵
     def _build_adjacent_matrix(self):
         entity2id = self.entity2id
-        token2id = self.token2id
+        word2id = self.word2id
         item_edger = pickle.load(open(os.path.join(DATA_PATH, "edger", self.dataset.lower(), "item_edger.pkl"), "rb"))
         entity_edger = pickle.load(open(os.path.join(DATA_PATH, "edger", self.dataset.lower(), "entity_edger.pkl"), "rb"))
         word_edger = pickle.load(open(os.path.join(DATA_PATH, "edger", self.dataset.lower(), "word_edger.pkl"), "rb"))
@@ -250,14 +262,14 @@ class HyCoRecModel(BaseModel):
         word_adj = {}
         for word_a in word_edger:
             word_list = word_edger[word_a]
-            if word_a not in token2id:
+            if word_a not in word2id:
                 continue
-            word_a = token2id[word_a]
+            word_a = word2id[word_a]
             convert_list = []
             for word in word_list:
-                if word not in token2id:
+                if word not in word2id:
                     continue
-                convert_list.append(token2id[word])
+                convert_list.append(word2id[word])
             word_adj[word_a] = convert_list
         self.word_adj = word_adj
 
@@ -278,15 +290,16 @@ class HyCoRecModel(BaseModel):
         self.entity_embedding = nn.Embedding(self.n_entity, self.kg_emb_dim, 0)
         nn.init.normal_(self.entity_embedding.weight, mean=0, std=self.kg_emb_dim ** -0.5)
         nn.init.constant_(self.entity_embedding.weight[0], 0)
-        self.word_embedding = nn.Embedding(self.n_entity, self.kg_emb_dim, 0)
+        self.word_embedding = nn.Embedding(self.n_word, self.kg_emb_dim, 0)
         nn.init.normal_(self.word_embedding.weight, mean=0, std=self.kg_emb_dim ** -0.5)
         nn.init.constant_(self.word_embedding.weight[0], 0)
         logger.debug('[Build embedding]')
         return
 
-    def _build_rgcn_stack(self):
+    def _build_rgcn_stack(self, n_relation=None):
+        n_relation = self.n_relation if n_relation is None else n_relation
         return nn.ModuleList([
-            RGCNConv(self.kg_emb_dim, self.kg_emb_dim, self.n_relation, num_bases=self.num_bases)
+            RGCNConv(self.kg_emb_dim, self.kg_emb_dim, n_relation, num_bases=self.num_bases)
             for _ in range(self.rgcn_layers)
         ])
 
@@ -339,10 +352,12 @@ class HyCoRecModel(BaseModel):
         x = dropouts[layer_idx](x)
         return x
 
-    def _run_rgcn_stack(self, node_embedding, encoders, norms, dropouts):
+    def _run_rgcn_stack(self, node_embedding, encoders, norms, dropouts, edge_idx=None, edge_type=None):
+        edge_idx = self.edge_idx if edge_idx is None else edge_idx
+        edge_type = self.edge_type if edge_type is None else edge_type
         out = node_embedding
         for layer_idx, encoder in enumerate(encoders):
-            out = encoder(out, self.edge_idx, self.edge_type)
+            out = encoder(out, edge_idx, edge_type)
             out = self._apply_graph_transition(out, norms, dropouts, layer_idx)
         return out
 
@@ -351,7 +366,7 @@ class HyCoRecModel(BaseModel):
         # graph encoder
         self.item_encoder = self._build_rgcn_stack()
         self.entity_encoder = self._build_rgcn_stack()
-        self.word_encoder = self._build_rgcn_stack()
+        self.word_encoder = self._build_rgcn_stack(self.word_n_relation)
         self.item_encoder_norms, self.item_encoder_dropouts = self._build_graph_transitions(self.rgcn_layers)
         self.entity_encoder_norms, self.entity_encoder_dropouts = self._build_graph_transitions(self.rgcn_layers)
         self.word_encoder_norms, self.word_encoder_dropouts = self._build_graph_transitions(self.rgcn_layers)
@@ -653,7 +668,9 @@ class HyCoRecModel(BaseModel):
                 self.word_embedding.weight,
                 self.word_encoder,
                 self.word_encoder_norms,
-                self.word_encoder_dropouts
+                self.word_encoder_dropouts,
+                self.word_edge_idx,
+                self.word_edge_type
             )
         }
         return kg_embeddings
@@ -788,6 +805,7 @@ class HyCoRecModel(BaseModel):
 
     def _run_hypergraph_view_layer(self, working_graph, layer_weights, layer_idx):
         layer_weights = layer_weights or {}
+        # print(layer_weights.get('item'),layer_weights.get('entity'),layer_weights.get('word'))
         item_embedding = self._run_hypergraph_conv(
             working_graph['item'],
             self.hyper_conv_item,
@@ -1235,6 +1253,8 @@ class HyCoRecModel(BaseModel):
         if len(self.gpu) >= 2:
             self.edge_idx = self.edge_idx.cuda(torch.cuda.current_device())
             self.edge_type = self.edge_type.cuda(torch.cuda.current_device())
+            self.word_edge_idx = self.word_edge_idx.cuda(torch.cuda.current_device())
+            self.word_edge_type = self.word_edge_type.cuda(torch.cuda.current_device())
         if stage == "conv":
             return self.converse(batch, mode)
         if stage == "rec":
@@ -1438,11 +1458,13 @@ class HyCoRecModel(BaseModel):
                 cf_weight = None
             sample_weights[graph_key] = f_weight
             sample_cf_weights[graph_key] = cf_weight
-            sample_topo[graph_key] = self._format_sample_topology(
-                graph_data,
-                f_weight,
-                cf_weight
-            )
+            if graph_key not in ablation_f_set and graph_key not in ablation_cf_set:
+                sample_topo[graph_key] = self._format_sample_topology(
+                    graph_data,
+                    f_weight,
+                    cf_weight
+                )
+            # print(f"[Layer {i}] {graph_key} hyperedge weights: {f_weight}, cf_weights: {cf_weight}")
 
         return sample_weights, sample_cf_weights, sample_topo
 

@@ -252,7 +252,7 @@ class ReDialDataset(BaseDataset):
         }
 
     def _word_kg_process(self):
-        edges = set()  # {(entity, entity)}
+        edge_list = []  # [(word, word, relation)]
         entities = set()
         for line in self.word_kg:
             kg = line.strip().split('\t')
@@ -260,10 +260,21 @@ class ReDialDataset(BaseDataset):
             entities.add(kg[2].split('/')[0])
             e0 = self.word2id[kg[1].split('/')[0]]
             e1 = self.word2id[kg[2].split('/')[0]]
-            edges.add((e0, e1))
-            edges.add((e1, e0))
-        # edge_set = [[co[0] for co in list(edges)], [co[1] for co in list(edges)]]
+            r = kg[0]
+            edge_list.append((e0, e1, r))
+            edge_list.append((e1, e0, r))
+            edge_list.append((e0, e0, 'SELF_LOOP'))
+            if e1 != e0:
+                edge_list.append((e1, e1, 'SELF_LOOP'))
+
+        relation2id, edges = dict(), set()
+        for h, t, r in edge_list:
+            if r not in relation2id:
+                relation2id[r] = len(relation2id)
+            edges.add((h, t, relation2id[r]))
+
         return {
             'edge': list(edges),
+            'n_relation': len(relation2id),
             'entity': list(entities)
         }

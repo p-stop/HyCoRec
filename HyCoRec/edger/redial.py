@@ -12,8 +12,8 @@ def get_side_data():
     side_data = []
     for k in dbpedia_subkg:
         pairs = dbpedia_subkg[k]
-        for pair in pairs:
-            side_data.append(pair)
+        for _, tail in pairs:  # pair = [relation_id, tail_entity_id]
+            side_data.append((int(k), tail))
 
     entity_side = {}
     for a, b in tqdm(side_data):
